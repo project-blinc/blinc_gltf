@@ -129,6 +129,26 @@ pub fn load_path<P: AsRef<Path>>(path: P) -> Result<GltfScene, Error> {
     from_import(&doc, &buffers, &images)
 }
 
+/// Tunables for [`load_asset_with_options`]. Everything is optional —
+/// `LoadOptions::default()` reproduces the behavior of [`load_asset`].
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// If set, images whose longer dimension exceeds this value are
+    /// resized (aspect-preserving) with bilinear filtering before the
+    /// decoded pixels are handed to the material parser. Bounded by
+    /// `1 = keep one texel`, unbounded above.
+    ///
+    /// Useful for asset budgets — a 4K texture downscaled to 2K is 4×
+    /// smaller on both CPU (during decode) and GPU (after upload) and
+    /// is visually indistinguishable at normal viewing distances.
+    ///
+    /// The cost is paid once at load, inside the `image` crate's
+    /// `DynamicImage::resize` with `FilterType::Triangle`. Assets that
+    /// ship textures already at or below the cap go through unchanged
+    /// with a single dimension check.
+    pub max_texture_size: Option<u32>,
+}
+
 /// Load a glTF asset through the global `blinc_platform::assets` loader.
 ///
 /// Unlike [`load_path`], which goes directly through the filesystem
@@ -148,8 +168,21 @@ pub fn load_path<P: AsRef<Path>>(path: P) -> Result<GltfScene, Error> {
 ///
 /// Data URIs (`data:...;base64,...`) are decoded inline without
 /// involving the asset loader.
+///
+/// For fine-grained control (texture downsampling, etc.) see
+/// [`load_asset_with_options`].
 #[cfg(feature = "platform-assets")]
 pub fn load_asset(path: &str) -> Result<GltfScene, Error> {
+    load_asset_with_options(path, &LoadOptions::default())
+}
+
+/// Same as [`load_asset`] but applies the transforms configured in
+/// `opts` (texture downsampling, future knobs).
+#[cfg(feature = "platform-assets")]
+pub fn load_asset_with_options(
+    path: &str,
+    opts: &LoadOptions,
+) -> Result<GltfScene, Error> {
     let bytes = blinc_platform::assets::load_asset(path)
         .map_err(|e| Error::Invalid(format!("asset load '{}': {}", path, e)))?;
 
@@ -157,7 +190,11 @@ pub fn load_asset(path: &str) -> Result<GltfScene, Error> {
     // files never reference external URIs, so they can go through the
     // existing slice-based path.
     if bytes.len() >= 4 && &bytes[0..4] == b"glTF" {
-        return load_glb(&bytes);
+        let (doc, buffers, mut images) = gltf::import_slice(&bytes)?;
+        if let Some(max) = opts.max_texture_size {
+            downsample_images(&mut images, max);
+        }
+        return from_import(&doc, &buffers, &images);
     }
 
     // JSON glTF — parse the document first, then manually resolve
@@ -166,8 +203,64 @@ pub fn load_asset(path: &str) -> Result<GltfScene, Error> {
     let base_dir: &str = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
     let gltf_obj = gltf::Gltf::from_slice(&bytes)?;
     let buffers = resolve_buffers(&gltf_obj, base_dir)?;
-    let images = resolve_images(&gltf_obj, base_dir, &buffers)?;
+    let mut images = resolve_images(&gltf_obj, base_dir, &buffers)?;
+    if let Some(max) = opts.max_texture_size {
+        downsample_images(&mut images, max);
+    }
     from_import(&gltf_obj.document, &buffers, &images)
+}
+
+/// Shrink any image in `images` whose longer dimension exceeds `max`,
+/// preserving aspect. Skipped for images already at or below the cap
+/// and for source formats other than RGB8 / RGBA8 (PNG/JPEG covers the
+/// common case; 16-bit + float layouts go through unchanged and get
+/// the RGBA8 expansion later in [`crate::material::image_to_texture`]).
+///
+/// Uses bilinear (`Triangle`) filtering — good quality for diffuse /
+/// normal / metallic-roughness maps, fast enough for load-time.
+#[cfg(feature = "platform-assets")]
+fn downsample_images(images: &mut [gltf::image::Data], max: u32) {
+    use image::{ImageBuffer, Rgba};
+    let max = max.max(1);
+    for img in images.iter_mut() {
+        let longer = img.width.max(img.height);
+        if longer <= max {
+            continue;
+        }
+
+        // Promote to RGBA8 inline so `ImageBuffer::from_raw` succeeds
+        // on the subsequent construction. Only R8G8B8 and R8G8B8A8
+        // are handled here; uncommon formats get skipped and pay the
+        // full-res expand later in `material::image_to_texture`.
+        let rgba_pixels: Vec<u8> = match img.format {
+            gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
+            gltf::image::Format::R8G8B8 => {
+                let mut out = Vec::with_capacity(img.pixels.len() / 3 * 4);
+                for chunk in img.pixels.chunks_exact(3) {
+                    out.extend_from_slice(chunk);
+                    out.push(255);
+                }
+                out
+            }
+            _ => continue,
+        };
+
+        let Some(buf): Option<ImageBuffer<Rgba<u8>, Vec<u8>>> =
+            ImageBuffer::from_raw(img.width, img.height, rgba_pixels)
+        else {
+            continue;
+        };
+        let dynimg = image::DynamicImage::ImageRgba8(buf);
+        let scale = max as f32 / longer as f32;
+        let new_w = ((img.width as f32 * scale).round() as u32).max(1);
+        let new_h = ((img.height as f32 * scale).round() as u32).max(1);
+        let resized =
+            dynimg.resize(new_w, new_h, image::imageops::FilterType::Triangle);
+        img.pixels = resized.to_rgba8().into_raw();
+        img.width = new_w;
+        img.height = new_h;
+        img.format = gltf::image::Format::R8G8B8A8;
+    }
 }
 
 /// Resolve a relative/data URI to raw bytes via `blinc_platform::assets`.

@@ -136,11 +136,7 @@ pub fn image_to_texture(img: &gltf::image::Data) -> Option<TextureData> {
         Format::R32G32B32FLOAT => downcast_rgb32f_to_rgba8(&img.pixels, n),
         Format::R32G32B32A32FLOAT => downcast_rgba32f_to_rgba8(&img.pixels, n),
     };
-    Some(TextureData {
-        rgba: bytes.into(),
-        width,
-        height,
-    })
+    Some(TextureData::new(bytes, width, height))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
