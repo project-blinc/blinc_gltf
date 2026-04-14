@@ -1,0 +1,42 @@
+[package]
+name = "blinc_gltf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "glTF 2.0 loader for Blinc — maps meshes, materials, nodes, skins, and animations into blinc_core types"
+repository = "https://github.com/project-blinc/blinc_gltf"
+readme = "README.md"
+rust-version = "1.75"
+keywords = ["gltf", "3d", "loader", "blinc"]
+categories = ["rendering::data-formats", "graphics"]
+
+# Standalone package — not a member of the Blinc workspace. Lives under
+# `/packages/` which is gitignored and workspace-excluded.
+
+[dependencies]
+# Path deps during local dev; pin to crates.io versions once published.
+blinc_core = { path = "../../crates/blinc_core" }
+blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+
+# Upstream glTF parser. Covers JSON + .glb, accessor decoding, external
+# buffer loading, image decoding via optional features.
+#
+# Features:
+# - `utils`       — accessor iteration helpers (Positions, Normals, Indices, ...)
+# - `names`       — preserve asset names (node, mesh, animation)
+# - `extras`      — keep `extras` JSON blobs as opaque `RawValue`
+# - `KHR_materials_unlit` — unlit extension parse support
+gltf = { version = "1.4", default-features = false, features = [
+    "utils",
+    "names",
+    "extras",
+    "KHR_materials_unlit",
+    "import",
+] }
+
+# Image decoding for textures. glTF embeds images as PNG/JPEG bytes
+# (data URIs or external references) — `image` turns those into raw
+# RGBA that `TextureData` expects.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+thiserror = "2.0"
