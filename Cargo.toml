@@ -14,13 +14,22 @@ categories = ["rendering::data-formats", "graphics"]
 # `/packages/` which is gitignored and workspace-excluded.
 
 [dependencies]
-# Path deps during local dev; pin to crates.io versions once published.
-blinc_core = { path = "../../crates/blinc_core" }
-blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+# Each Blinc dep is declared with both `path` and `git`:
+#   - `path` is used during local dev when this crate sits next to a
+#     Blinc checkout (the standard `/packages/blinc_gltf` layout under
+#     a Blinc workspace).
+#   - `git` is used when this crate is fetched as a git dependency by
+#     a downstream consumer (CI, external project) — the relative
+#     path doesn't resolve in `~/.cargo/git/...` checkouts, so cargo
+#     falls back to the git source.
+# Pin to a specific Blinc rev so downstream builds are deterministic;
+# bump in lockstep with the corresponding `Blinc` repo commit.
+blinc_core = { path = "../../crates/blinc_core", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295" }
+blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295" }
 # Optional cross-platform asset loader integration. Gated behind the
 # `platform-assets` feature so pure-desktop users can keep depending
 # on `std::fs` via `load_path` without pulling in the platform crate.
-blinc_platform = { path = "../../crates/blinc_platform", optional = true }
+blinc_platform = { path = "../../crates/blinc_platform", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295", optional = true }
 
 # Upstream glTF parser. Covers JSON + .glb, accessor decoding, external
 # buffer loading, image decoding via optional features.
