@@ -9,40 +9,62 @@
 
 use blinc_core::draw::{AlphaMode, Material, TextureData};
 
-/// Decode a glTF material into Blinc's `Material`. Texture slots read
-/// from the `images` array; missing textures fall back to the scalar
-/// factors alone.
-pub fn parse_material(mat: &gltf::Material, images: &[gltf::image::Data]) -> Material {
+/// Decode a glTF material into Blinc's `Material`.
+///
+/// `decoded_images[i]` must hold the pre-decoded texture for glTF
+/// image index `i` (see [`crate::decode_images_once`]). Sharing a
+/// decoded-once image pool across every material call means a single
+/// 4K × 4K RGBA image that's referenced by ten materials exists exactly
+/// once in memory — `TextureData::clone()` is a refcount bump on the
+/// underlying `Arc<[u8]>`.
+pub fn parse_material(
+    mat: &gltf::Material,
+    decoded_images: &[Option<TextureData>],
+) -> Material {
+    let tex = |idx: usize| decoded_images.get(idx).and_then(|t| t.clone());
     let pbr = mat.pbr_metallic_roughness();
 
     let base_color_texture = pbr
         .base_color_texture()
-        .and_then(|info| image_to_texture(&images[info.texture().source().index()]));
+        .and_then(|info| tex(info.texture().source().index()));
     let metallic_roughness_texture = pbr
         .metallic_roughness_texture()
-        .and_then(|info| image_to_texture(&images[info.texture().source().index()]));
+        .and_then(|info| tex(info.texture().source().index()));
     let normal_info = mat.normal_texture();
     let normal_map = normal_info
         .as_ref()
-        .and_then(|info| image_to_texture(&images[info.texture().source().index()]));
+        .and_then(|info| tex(info.texture().source().index()));
     let normal_scale = normal_info.as_ref().map(|n| n.scale()).unwrap_or(1.0);
     let occlusion_info = mat.occlusion_texture();
     let occlusion_texture = occlusion_info
         .as_ref()
-        .and_then(|info| image_to_texture(&images[info.texture().source().index()]));
+        .and_then(|info| tex(info.texture().source().index()));
     let occlusion_strength = occlusion_info
         .as_ref()
         .map(|o| o.strength())
         .unwrap_or(1.0);
     let emissive_texture = mat
         .emissive_texture()
-        .and_then(|info| image_to_texture(&images[info.texture().source().index()]));
+        .and_then(|info| tex(info.texture().source().index()));
+
+    // `KHR_materials_emissive_strength` — the `emissiveFactor` in
+    // core glTF is clamped to `[0, 1]` per channel; authors who want
+    // HDR glow (dashboards, eyes, lit details) use this extension to
+    // multiply the factor by a scalar. When the extension is absent
+    // the strength defaults to `1.0`, leaving the factor untouched.
+    let emissive_factor = mat.emissive_factor();
+    let emissive_strength = mat.emissive_strength().unwrap_or(1.0);
+    let emissive = [
+        emissive_factor[0] * emissive_strength,
+        emissive_factor[1] * emissive_strength,
+        emissive_factor[2] * emissive_strength,
+    ];
 
     Material {
         base_color: pbr.base_color_factor(),
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
-        emissive: mat.emissive_factor(),
+        emissive,
         base_color_texture,
         normal_map,
         normal_scale,
@@ -53,14 +75,33 @@ pub fn parse_material(mat: &gltf::Material, images: &[gltf::image::Data]) -> Mat
         // Displacement mapping has no glTF core analog; extension
         // support would go through `KHR_materials_displacement` (no
         // standard at the time of writing).
+        //
+        // `displacement_scale` MUST be `0.0` when `displacement_map`
+        // is `None`: the mesh shader's parallax block is gated on
+        // `scale > 0`, NOT on map presence. With a non-zero scale it
+        // marches UVs through the bound displacement texture (the
+        // pipeline's default 1×1 fallback when no map is attached)
+        // and discards any fragment whose UV drifts out of `[0, 1]`.
+        // For curved surfaces viewed at glancing angles that happens
+        // at almost every pixel — making meshes invisible. Leave
+        // scale at zero unless an actual map is set.
         displacement_map: None,
-        displacement_scale: 0.05,
+        displacement_scale: 0.0,
         unlit: mat.unlit(),
         alpha_mode: match mat.alpha_mode() {
             gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
             gltf::material::AlphaMode::Mask => AlphaMode::Mask,
             gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         },
+        // Shadows on by default. Blinc's mesh pipeline does
+        // two-phase shadow mapping: one depth pass over every caster
+        // populates a shared shadow map, then the main color pass
+        // samples it with PCF. Per-mesh cost is one extra depth-only
+        // draw plus an O(1) shadow sampler in the fragment shader —
+        // cheap enough that defaulting to off silently hid shadows
+        // from everyone who just calls `load_path(...)` and renders.
+        // Callers who need the old opt-in behavior can clear both
+        // flags via `map_material`.
         receives_shadows: true,
         casts_shadows: true,
     }
@@ -69,16 +110,21 @@ pub fn parse_material(mat: &gltf::Material, images: &[gltf::image::Data]) -> Mat
 /// Convert a decoded glTF image into Blinc's [`TextureData`].
 ///
 /// glTF images come in several pixel layouts (`R8`, `R8G8`, `R8G8B8`,
-/// `R8G8B8A8`, plus 16-bit variants). We expand everything to RGBA8
-/// since Blinc's `TextureData` is a flat RGBA buffer. 16-bit formats
-/// are downcast to 8-bit; this matches the shader's 8-bit sampling
-/// target but loses some precision — see BACKLOG for 16-bit passthrough.
-fn image_to_texture(img: &gltf::image::Data) -> Option<TextureData> {
+/// `R8G8B8A8`, plus 16-bit and 32-bit float variants). We expand
+/// everything to RGBA8 since Blinc's `TextureData` is a flat RGBA
+/// buffer. 16-bit formats are downcast to 8-bit; this matches the
+/// shader's 8-bit sampling target but loses some precision — see
+/// BACKLOG for 16-bit passthrough.
+///
+/// The output `rgba` buffer is wrapped in `Arc<[u8]>` so that callers
+/// can stamp the returned `TextureData` onto many materials via a
+/// cheap refcount bump.
+pub fn image_to_texture(img: &gltf::image::Data) -> Option<TextureData> {
     use gltf::image::Format;
     let width = img.width;
     let height = img.height;
     let n = (width as usize) * (height as usize);
-    let rgba = match img.format {
+    let bytes: Vec<u8> = match img.format {
         Format::R8 => expand_r_to_rgba(&img.pixels, n),
         Format::R8G8 => expand_rg_to_rgba(&img.pixels, n),
         Format::R8G8B8 => expand_rgb_to_rgba(&img.pixels, n),
@@ -91,7 +137,7 @@ fn image_to_texture(img: &gltf::image::Data) -> Option<TextureData> {
         Format::R32G32B32A32FLOAT => downcast_rgba32f_to_rgba8(&img.pixels, n),
     };
     Some(TextureData {
-        rgba,
+        rgba: bytes.into(),
         width,
         height,
     })

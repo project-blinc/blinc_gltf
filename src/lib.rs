@@ -105,6 +105,11 @@ pub struct GltfScene {
 pub struct GltfMesh {
     pub name: Option<String>,
     pub primitives: Vec<MeshData>,
+    /// Axis-aligned bounding box in the mesh's local coordinate space,
+    /// covering every primitive. Sourced from the primitive's
+    /// `POSITION` accessor min/max, which the glTF spec requires to be
+    /// set. Used by [`GltfScene::world_aabb`] for camera framing.
+    pub local_bbox: ([f32; 3], [f32; 3]),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,19 +129,208 @@ pub fn load_path<P: AsRef<Path>>(path: P) -> Result<GltfScene, Error> {
     from_import(&doc, &buffers, &images)
 }
 
+/// Load a glTF asset through the global `blinc_platform::assets` loader.
+///
+/// Unlike [`load_path`], which goes directly through the filesystem
+/// via `gltf::import`, this entry point defers every read (the main
+/// file plus every external buffer and image referenced via relative
+/// URI) to whatever `AssetLoader` the host registered with
+/// `blinc_platform`. That means the same code path works on:
+///
+/// - Desktop — default `FilesystemAssetLoader`
+/// - Android — APK `AssetManager` loader
+/// - iOS — app-bundle loader
+/// - Web — HTTP-fetch loader
+///
+/// `path` is passed verbatim to `blinc_platform::assets::load_asset`
+/// for the main file; external URIs are resolved by prepending
+/// `path`'s parent directory and forwarding to the same loader.
+///
+/// Data URIs (`data:...;base64,...`) are decoded inline without
+/// involving the asset loader.
+#[cfg(feature = "platform-assets")]
+pub fn load_asset(path: &str) -> Result<GltfScene, Error> {
+    let bytes = blinc_platform::assets::load_asset(path)
+        .map_err(|e| Error::Invalid(format!("asset load '{}': {}", path, e)))?;
+
+    // Detect self-contained binary glTF by its magic header. `.glb`
+    // files never reference external URIs, so they can go through the
+    // existing slice-based path.
+    if bytes.len() >= 4 && &bytes[0..4] == b"glTF" {
+        return load_glb(&bytes);
+    }
+
+    // JSON glTF — parse the document first, then manually resolve
+    // each buffer/image through `blinc_platform::assets` with the
+    // main file's parent directory as the URI base.
+    let base_dir: &str = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let gltf_obj = gltf::Gltf::from_slice(&bytes)?;
+    let buffers = resolve_buffers(&gltf_obj, base_dir)?;
+    let images = resolve_images(&gltf_obj, base_dir, &buffers)?;
+    from_import(&gltf_obj.document, &buffers, &images)
+}
+
+/// Resolve a relative/data URI to raw bytes via `blinc_platform::assets`.
+///
+/// Kept separate from `load_asset` so buffer and image loops stay
+/// small. Data URIs don't touch the asset loader.
+#[cfg(feature = "platform-assets")]
+fn resolve_uri_bytes(uri: &str, base_dir: &str) -> Result<Vec<u8>, Error> {
+    if let Some(rest) = uri.strip_prefix("data:") {
+        // `data:[<media type>];base64,<data>` — only base64 payloads
+        // are defined for glTF URIs.
+        let (_, b64) = rest
+            .split_once(";base64,")
+            .ok_or_else(|| Error::Invalid(format!("unsupported data URI: {}", uri)))?;
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| Error::Invalid(format!("base64 decode: {}", e)));
+    }
+    // Treat everything else as a relative path. glTF also allows
+    // `file:` URIs but those are a desktop-only concept that doesn't
+    // make sense through an asset loader abstraction — callers who
+    // need them should stay on `load_path`.
+    let full = if base_dir.is_empty() {
+        uri.to_string()
+    } else {
+        format!("{}/{}", base_dir, uri)
+    };
+    blinc_platform::assets::load_asset(&full)
+        .map_err(|e| Error::Invalid(format!("asset load '{}': {}", full, e)))
+}
+
+#[cfg(feature = "platform-assets")]
+fn resolve_buffers(
+    gltf_obj: &gltf::Gltf,
+    base_dir: &str,
+) -> Result<Vec<gltf::buffer::Data>, Error> {
+    let mut out = Vec::new();
+    // `Gltf::blob` holds the BIN chunk of a .glb — we've already
+    // shunted .glb through `load_glb`, so here `blob` is always None.
+    let mut blob: Option<Vec<u8>> = gltf_obj.blob.clone();
+    for buffer in gltf_obj.document.buffers() {
+        let data = match buffer.source() {
+            gltf::buffer::Source::Bin => blob
+                .take()
+                .ok_or_else(|| Error::Invalid("missing GLB blob".into()))?,
+            gltf::buffer::Source::Uri(uri) => resolve_uri_bytes(uri, base_dir)?,
+        };
+        // glTF spec requires buffer byte length match the accessor
+        // use; short buffers would panic later in accessor reads.
+        if data.len() < buffer.length() {
+            return Err(Error::Invalid(format!(
+                "buffer {} short: expected {}, got {}",
+                buffer.index(),
+                buffer.length(),
+                data.len()
+            )));
+        }
+        // `buffer::Data` is a tuple struct with a pub Vec<u8> field.
+        // We also pad to a 4-byte boundary to match the upstream
+        // `from_source_and_blob` behavior (accessors require it).
+        let mut padded = data;
+        while padded.len() % 4 != 0 {
+            padded.push(0);
+        }
+        out.push(gltf::buffer::Data(padded));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "platform-assets")]
+fn resolve_images(
+    gltf_obj: &gltf::Gltf,
+    base_dir: &str,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Vec<gltf::image::Data>, Error> {
+    use gltf::image::Format;
+    use image::GenericImageView;
+
+    let mut out = Vec::new();
+    for image in gltf_obj.document.images() {
+        let (encoded, mime): (Vec<u8>, Option<&str>) = match image.source() {
+            gltf::image::Source::Uri { uri, mime_type } => {
+                (resolve_uri_bytes(uri, base_dir)?, mime_type)
+            }
+            gltf::image::Source::View { view, mime_type } => {
+                let buf = &buffers[view.buffer().index()].0;
+                let begin = view.offset();
+                let end = begin + view.length();
+                (buf[begin..end].to_vec(), Some(mime_type))
+            }
+        };
+
+        // Pick a decoder. Fall back to content-sniffing when the
+        // mime type is missing — glTF allows either, and the image
+        // crate's own `guess_format` handles png/jpg cleanly.
+        let decoded = match mime {
+            Some("image/png") => image::load_from_memory_with_format(&encoded, image::ImageFormat::Png),
+            Some("image/jpeg") => image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg),
+            _ => image::load_from_memory(&encoded),
+        }
+        .map_err(|e| Error::Invalid(format!("image decode: {}", e)))?;
+
+        let (w, h) = decoded.dimensions();
+        let pixels = decoded.to_rgba8().into_raw();
+        out.push(gltf::image::Data {
+            pixels,
+            format: Format::R8G8B8A8,
+            width: w,
+            height: h,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode every image in the glTF asset exactly once into an
+/// `Arc<[u8]>`-backed [`blinc_core::draw::TextureData`].
+///
+/// glTF assets commonly reuse a single source image across multiple
+/// materials (e.g. one 4K albedo shared by five body primitives).
+/// Without this pre-decode step, [`crate::material::parse_material`]
+/// would re-decode + reallocate the image for every material
+/// reference. Returning one `TextureData` per image lets subsequent
+/// material parses share the underlying pixel buffer via refcount
+/// bumps, keeping memory proportional to the number of *unique*
+/// images, not the number of material-texture-slot references.
+pub fn decode_images_once(images: &[gltf::image::Data]) -> Vec<Option<TextureData>> {
+    images.iter().map(material::image_to_texture).collect()
+}
+
 fn from_import(
     doc: &gltf::Document,
     buffers: &[gltf::buffer::Data],
     images: &[gltf::image::Data],
 ) -> Result<GltfScene, Error> {
+    let decoded_images = decode_images_once(images);
     let meshes = doc
         .meshes()
-        .map(|m| GltfMesh {
-            name: m.name().map(str::to_string),
-            primitives: m
+        .map(|m| {
+            let primitives: Vec<MeshData> = m
                 .primitives()
-                .map(|p| parse_primitive(&p, buffers, images))
-                .collect(),
+                .map(|p| parse_primitive(&p, buffers, &decoded_images))
+                .collect();
+            // Union per-primitive POSITION-accessor bounds into a
+            // single mesh-local AABB. Every primitive's POSITION
+            // accessor is required to carry min/max per the spec, so
+            // this is a metadata read — no vertex iteration.
+            let local_bbox = m.primitives().fold(
+                ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+                |(mut mn, mut mx), p| {
+                    let bb = p.bounding_box();
+                    for i in 0..3 {
+                        mn[i] = mn[i].min(bb.min[i]);
+                        mx[i] = mx[i].max(bb.max[i]);
+                    }
+                    (mn, mx)
+                },
+            );
+            GltfMesh {
+                name: m.name().map(str::to_string),
+                primitives,
+                local_bbox,
+            }
         })
         .collect();
 
@@ -180,6 +374,51 @@ impl GltfScene {
             walk_transforms(self, root, Mat4::IDENTITY, &mut world);
         }
         world
+    }
+
+    /// Axis-aligned bounding box of every mesh-bearing node in world
+    /// space, computed at the scene's rest pose (before any animation
+    /// is sampled into node transforms).
+    ///
+    /// Returns `(min, max)` as `[f32; 3]` pairs, or `None` if the
+    /// scene has no mesh-bearing nodes. Each mesh's local AABB
+    /// ([`GltfMesh::local_bbox`]) is transformed by its node's world
+    /// matrix via the 8-corner method — tight enough for camera
+    /// framing, conservative enough to avoid popping.
+    pub fn world_aabb(&self) -> Option<([f32; 3], [f32; 3])> {
+        let world = self.compute_world_transforms();
+        let mut accum: Option<([f32; 3], [f32; 3])> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            let Some(mesh_idx) = node.mesh else { continue };
+            let Some(mesh) = self.meshes.get(mesh_idx) else {
+                continue;
+            };
+            let (lmin, lmax) = mesh.local_bbox;
+            if !lmin[0].is_finite() || !lmax[0].is_finite() {
+                continue; // empty-mesh guard
+            }
+            let corners: [[f32; 3]; 8] = [
+                [lmin[0], lmin[1], lmin[2]],
+                [lmin[0], lmin[1], lmax[2]],
+                [lmin[0], lmax[1], lmin[2]],
+                [lmin[0], lmax[1], lmax[2]],
+                [lmax[0], lmin[1], lmin[2]],
+                [lmax[0], lmin[1], lmax[2]],
+                [lmax[0], lmax[1], lmin[2]],
+                [lmax[0], lmax[1], lmax[2]],
+            ];
+            for corner in corners {
+                let w = transform_point(&world[i], corner);
+                accum = Some(match accum {
+                    None => (w, w),
+                    Some((mn, mx)) => (
+                        [mn[0].min(w[0]), mn[1].min(w[1]), mn[2].min(w[2])],
+                        [mx[0].max(w[0]), mx[1].max(w[1]), mx[2].max(w[2])],
+                    ),
+                });
+            }
+        }
+        accum
     }
 
     /// Populate a `SceneKit3D` with this asset's meshes. Node world

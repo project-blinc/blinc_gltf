@@ -17,6 +17,10 @@ categories = ["rendering::data-formats", "graphics"]
 # Path deps during local dev; pin to crates.io versions once published.
 blinc_core = { path = "../../crates/blinc_core" }
 blinc_canvas_kit = { path = "../../crates/blinc_canvas_kit" }
+# Optional cross-platform asset loader integration. Gated behind the
+# `platform-assets` feature so pure-desktop users can keep depending
+# on `std::fs` via `load_path` without pulling in the platform crate.
+blinc_platform = { path = "../../crates/blinc_platform", optional = true }
 
 # Upstream glTF parser. Covers JSON + .glb, accessor decoding, external
 # buffer loading, image decoding via optional features.
@@ -31,6 +35,7 @@ gltf = { version = "1.4", default-features = false, features = [
     "names",
     "extras",
     "KHR_materials_unlit",
+    "KHR_materials_emissive_strength",
     "import",
 ] }
 
@@ -39,4 +44,18 @@ gltf = { version = "1.4", default-features = false, features = [
 # RGBA that `TextureData` expects.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+# Base64 decoder for glTF `data:...;base64,...` URIs. The upstream
+# `gltf` crate uses this internally but doesn't re-export it; we need
+# it directly for the cross-platform asset loader path that can't use
+# `gltf::import` (which is filesystem-bound).
+base64 = "0.22"
+
 thiserror = "2.0"
+
+[features]
+default = []
+# Enables `load_asset()` — cross-platform glTF loading via the global
+# `blinc_platform::assets` loader. Off by default so the crate stays a
+# thin wrapper around the `gltf` parser for callers who want their own
+# asset pipeline.
+platform-assets = ["dep:blinc_platform"]

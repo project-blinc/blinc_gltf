@@ -5,16 +5,21 @@
 //! feature to handle component-type casting (e.g. `u8`/`u16`/`u32`
 //! joint indices), normalization, and sparse accessors automatically.
 
-use blinc_core::draw::{MeshData, Vertex};
+use blinc_core::draw::{MeshData, TextureData, Vertex};
 
 use crate::material;
 
 /// Parse a single primitive into a `MeshData`, materializing every
 /// available vertex attribute.
+///
+/// `decoded_images` is the pre-decoded image pool produced by
+/// [`crate::decode_images_once`]; every material reference to an
+/// image index becomes a cheap `TextureData::clone()` sharing the same
+/// underlying `Arc<[u8]>` byte buffer.
 pub fn parse_primitive(
     primitive: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
-    images: &[gltf::image::Data],
+    decoded_images: &[Option<TextureData>],
 ) -> MeshData {
     let reader = primitive.reader(|b| Some(&buffers[b.index()].0));
 
@@ -29,6 +34,14 @@ pub fn parse_primitive(
     let vertex_count = positions.len();
 
     let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|iter| iter.collect());
+
+    // UVs outside [0, 1] are legal glTF — the spec expects the
+    // sampler's wrap mode (as declared on the material's sampler) to
+    // handle them. Blinc's mesh pipeline's sampler is configured for
+    // `Repeat` wrap, so we pass the authored UVs through untouched.
+    // Forcing UVs into `[0, 1]` via `u - u.floor()` would break any
+    // triangle whose UV shell straddles the 0/1 seam — the shell
+    // would snap and streak across the texture.
     let uvs: Option<Vec<[f32; 2]>> = reader
         .read_tex_coords(0)
         .map(|iter| iter.into_f32().collect());
@@ -84,7 +97,7 @@ pub fn parse_primitive(
         .map(|iter| iter.into_u32().collect())
         .unwrap_or_else(|| (0..vertex_count as u32).collect());
 
-    let material = material::parse_material(&primitive.material(), images);
+    let material = material::parse_material(&primitive.material(), decoded_images);
 
     MeshData {
         vertices,
