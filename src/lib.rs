@@ -74,6 +74,55 @@ pub use skin::GltfSkeleton;
 // output.
 pub use blinc_core::draw::{Bone, Material, Skeleton, TextureData, Vertex};
 
+/// Walk every primitive in `scene` and hand its `Material` to a
+/// user-supplied closure. Lets the caller re-author per-mesh render
+/// hints after load — demote BLEND hair to MASK, clamp a too-generous
+/// alpha cutoff, disable shadows on an intentionally-transparent
+/// decal, stamp emissive on a specific mesh, etc.
+///
+/// Every existing "post-parse fixup loop" in the demos (rotor-shadow
+/// disable, lens emissive stamp, cutegirl hair demotion) collapses
+/// into one call with a match arm.
+///
+/// The closure receives:
+/// - `mesh_index` — index into `scene.meshes`
+/// - `mesh_name` — from `GltfMesh.name`, `None` for unnamed meshes
+/// - `prim_index` — index within the mesh's primitives
+/// - `material` — mutable reference to the primitive's material
+///
+/// Example — demote every BLEND material to MASK with 0.5 cutoff:
+///
+/// ```ignore
+/// apply_material_overrides(&mut scene, |_, _, _, mat| {
+///     if mat.alpha_mode == AlphaMode::Blend {
+///         mat.alpha_mode = AlphaMode::Mask;
+///         mat.alpha_cutoff = 0.5;
+///     }
+/// });
+/// ```
+///
+/// Example — disable shadows on anything named "Turbine":
+///
+/// ```ignore
+/// apply_material_overrides(&mut scene, |_, name, _, mat| {
+///     if name.map_or(false, |n| n.contains("Turbine")) {
+///         mat.casts_shadows = false;
+///         mat.receives_shadows = false;
+///     }
+/// });
+/// ```
+pub fn apply_material_overrides<F>(scene: &mut GltfScene, mut f: F)
+where
+    F: FnMut(usize, Option<&str>, usize, &mut Material),
+{
+    for (mesh_index, mesh) in scene.meshes.iter_mut().enumerate() {
+        let name = mesh.name.as_deref();
+        for (prim_index, prim) in mesh.primitives.iter_mut().enumerate() {
+            f(mesh_index, name, prim_index, &mut prim.material);
+        }
+    }
+}
+
 /// Errors returned by the loader.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
