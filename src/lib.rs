@@ -576,7 +576,10 @@ fn bake_transform(mesh: &MeshData, m: &Mat4) -> MeshData {
     // until someone applies `node.scale = [1, 0.5, 1]`.
     let normal_matrix = inverse_transpose_upper3x3(m);
     let mut out = mesh.clone();
-    for v in &mut out.vertices {
+    // Bake into a unique copy of the shared vertex buffer. `make_mut`
+    // clones the inner Vec if the Arc is shared, otherwise mutates
+    // in place — the right thing in both cases.
+    for v in std::sync::Arc::make_mut(&mut out.vertices) {
         v.position = transform_point(m, v.position);
         v.normal = normalize3(mul3x3(&normal_matrix, v.normal));
         // Tangents are direction vectors too (but stay in the

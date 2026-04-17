@@ -121,10 +121,13 @@ pub fn parse_primitive(
         .collect();
 
     MeshData {
-        vertices,
-        indices,
+        vertices: std::sync::Arc::new(vertices),
+        indices: std::sync::Arc::new(indices),
         material,
         skin: None, // Skinning data is provided per-frame by blinc_skeleton
-        morph_targets,
+        morph_targets: std::sync::Arc::new(morph_targets),
+        // Empty until the demo / render path installs per-frame
+        // weights from `blinc_skeleton::Pose::morph_weights`.
+        morph_weights: Vec::new(),
     }
 }
