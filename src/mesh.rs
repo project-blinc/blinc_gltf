@@ -99,10 +99,32 @@ pub fn parse_primitive(
 
     let material = material::parse_material(&primitive.material(), decoded_images);
 
+    // Morph targets — per-vertex deltas on top of the base mesh.
+    // `reader.read_morph_targets()` yields `(position, normal, tangent)`
+    // iterator tuples per target; each inner iterator is already
+    // positional-aligned with the base vertices, so we just collect.
+    // Normals / tangents are optional per target.
+    let morph_targets: Vec<blinc_core::draw::MorphTarget> = reader
+        .read_morph_targets()
+        .map(|(pos, nrm, tan)| {
+            let delta_positions: Vec<[f32; 3]> = pos
+                .map(|iter| iter.collect())
+                .unwrap_or_default();
+            let delta_normals: Option<Vec<[f32; 3]>> = nrm.map(|iter| iter.collect());
+            let delta_tangents: Option<Vec<[f32; 3]>> = tan.map(|iter| iter.collect());
+            blinc_core::draw::MorphTarget {
+                delta_positions,
+                delta_normals,
+                delta_tangents,
+            }
+        })
+        .collect();
+
     MeshData {
         vertices,
         indices,
         material,
         skin: None, // Skinning data is provided per-frame by blinc_skeleton
+        morph_targets,
     }
 }
