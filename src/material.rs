@@ -2,10 +2,8 @@
 //!
 //! Covers the full `pbrMetallicRoughness` block plus standard texture
 //! slots (base color, normal, metallic-roughness, emissive, occlusion)
-//! and the `KHR_materials_unlit` extension. Alpha mode maps directly;
-//! the glTF `alphaCutoff` value for `MASK` mode isn't yet threaded into
-//! `blinc_core::draw::Material` (it assumes the shader's default 0.5
-//! cutoff).
+//! and the `KHR_materials_unlit` extension. Alpha mode + cutoff both
+//! thread through to `Material.alpha_mode` and `Material.alpha_cutoff`.
 
 use blinc_core::draw::{AlphaMode, Material, TextureData};
 
@@ -93,6 +91,9 @@ pub fn parse_material(
             gltf::material::AlphaMode::Mask => AlphaMode::Mask,
             gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         },
+        // glTF's `alphaCutoff` — only meaningful when alpha_mode is
+        // Mask. Absent from the JSON means "use the spec default 0.5".
+        alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
         // Shadows on by default. Blinc's mesh pipeline does
         // two-phase shadow mapping: one depth pass over every caster
         // populates a shared shadow map, then the main color pass
