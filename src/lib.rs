@@ -459,6 +459,23 @@ fn from_import(
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl GltfScene {
+    /// Look up a node by its authored name. Returns the first match
+    /// (glTF doesn't enforce name uniqueness, but DCC-exported scenes
+    /// typically don't duplicate them). `None` if no node carries the
+    /// name — or if the `gltf` crate's `names` feature isn't enabled
+    /// and node names were discarded at parse time.
+    ///
+    /// Typical use: downstream demos that pin runtime behaviour to a
+    /// specific named node (the buster_drone demo's rotor-subtree
+    /// scan is the existing example) can replace manual `enumerate +
+    /// filter_map` walks with
+    /// `scene.node_by_name("Turbine_L")`.
+    pub fn node_by_name(&self, name: &str) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|n| n.name.as_deref() == Some(name))
+    }
+
     /// Compose each node's local transform with its ancestor chain,
     /// returning world-space 4×4 matrices indexed parallel to `nodes`.
     pub fn compute_world_transforms(&self) -> Vec<Mat4> {
@@ -550,13 +567,22 @@ fn walk_transforms(scene: &GltfScene, idx: usize, parent: Mat4, out: &mut [Mat4]
 }
 
 fn bake_transform(mesh: &MeshData, m: &Mat4) -> MeshData {
+    // Normals and tangents need the *inverse-transpose* of the
+    // upper-3×3 under non-uniform scale; naïvely applying the same
+    // matrix you use for positions (`transform_direction`) skews
+    // them toward the squashed axis. For uniform scale /
+    // rotation-only transforms the two matrices differ only by a
+    // scalar (which normalise3 absorbs), so the bug goes unnoticed
+    // until someone applies `node.scale = [1, 0.5, 1]`.
+    let normal_matrix = inverse_transpose_upper3x3(m);
     let mut out = mesh.clone();
     for v in &mut out.vertices {
         v.position = transform_point(m, v.position);
-        v.normal = normalize3(transform_direction(m, v.normal));
-        // Tangent's xyz is a direction; w is handedness and passes
-        // through unchanged.
-        let t = transform_direction(m, [v.tangent[0], v.tangent[1], v.tangent[2]]);
+        v.normal = normalize3(mul3x3(&normal_matrix, v.normal));
+        // Tangents are direction vectors too (but stay in the
+        // surface's tangent plane — the same inverse-transpose fix
+        // applies). `w` is a handedness sign and passes through.
+        let t = mul3x3(&normal_matrix, [v.tangent[0], v.tangent[1], v.tangent[2]]);
         let t = normalize3(t);
         v.tangent = [t[0], t[1], t[2], v.tangent[3]];
     }
@@ -572,15 +598,49 @@ fn transform_point(m: &Mat4, p: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn transform_direction(m: &Mat4, d: [f32; 3]) -> [f32; 3] {
-    // Direction vector — w = 0, so translation drops out. For perfect
-    // normal transform under non-uniform scale we'd apply the
-    // inverse-transpose of the upper-3×3; that's on the BACKLOG.
-    let c = &m.cols;
+fn mul3x3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    // Column-major 3×3 multiply: `out[i] = Σ m[j][i] * v[j]`.
     [
-        c[0][0] * d[0] + c[1][0] * d[1] + c[2][0] * d[2],
-        c[0][1] * d[0] + c[1][1] * d[1] + c[2][1] * d[2],
-        c[0][2] * d[0] + c[1][2] * d[1] + c[2][2] * d[2],
+        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2],
+        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2],
+        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// Inverse-transpose of a 4×4 transform's upper-3×3. Falls back to
+/// the plain upper-3×3 on singular matrices (determinant near zero) —
+/// keeps a valid-ish normal rather than blowing up on assets with
+/// a degenerate node scale. Column-major throughout so the return
+/// value plugs directly into [`mul3x3`].
+fn inverse_transpose_upper3x3(m: &Mat4) -> [[f32; 3]; 3] {
+    let a = [
+        [m.cols[0][0], m.cols[0][1], m.cols[0][2]],
+        [m.cols[1][0], m.cols[1][1], m.cols[1][2]],
+        [m.cols[2][0], m.cols[2][1], m.cols[2][2]],
+    ];
+    // Cofactor expansion along column 0.
+    let c00 = a[1][1] * a[2][2] - a[1][2] * a[2][1];
+    let c01 = -(a[1][0] * a[2][2] - a[1][2] * a[2][0]);
+    let c02 = a[1][0] * a[2][1] - a[1][1] * a[2][0];
+    let det = a[0][0] * c00 + a[0][1] * c01 + a[0][2] * c02;
+    if det.abs() < 1e-8 {
+        // Degenerate — fall back to identity-ish: just use the
+        // original upper-3×3 so normals rotate but don't flip.
+        return a;
+    }
+    let inv_det = 1.0 / det;
+    // Build `inverse(a)` via cofactor matrix, then take the transpose
+    // in one step by writing rows of the inverse as columns.
+    let c10 = -(a[0][1] * a[2][2] - a[0][2] * a[2][1]);
+    let c11 = a[0][0] * a[2][2] - a[0][2] * a[2][0];
+    let c12 = -(a[0][0] * a[2][1] - a[0][1] * a[2][0]);
+    let c20 = a[0][1] * a[1][2] - a[0][2] * a[1][1];
+    let c21 = -(a[0][0] * a[1][2] - a[0][2] * a[1][0]);
+    let c22 = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    [
+        [c00 * inv_det, c01 * inv_det, c02 * inv_det],
+        [c10 * inv_det, c11 * inv_det, c12 * inv_det],
+        [c20 * inv_det, c21 * inv_det, c22 * inv_det],
     ]
 }
 
@@ -595,10 +655,114 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn crate_compiles() {
         // Smoke: asserts the module graph wires together. Real
         // round-trip tests need fixture `.glb` files and belong in the
         // integration-test layer once we ship one.
+    }
+
+    #[test]
+    fn inverse_transpose_preserves_normal_under_non_uniform_scale() {
+        // Column-major transform that scales +Y by 2 and leaves XZ
+        // alone. A normal pointing diagonally in the XY plane should,
+        // after the transform, still be perpendicular to the surface
+        // — which under non-uniform scale means the Y component
+        // shrinks, not grows. Compare with naïve "apply the same
+        // matrix" to confirm the old path bent the normal the wrong
+        // way.
+        let m = Mat4 {
+            cols: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let n_before = normalize3([1.0, 1.0, 0.0]);
+        let inv_t = inverse_transpose_upper3x3(&m);
+        let n_after = normalize3(mul3x3(&inv_t, n_before));
+        // Expected: inverse-transpose of scale(1, 2, 1) is
+        // scale(1, 0.5, 1). Applied to (√2/2, √2/2, 0) gives
+        // (√2/2, √2/4, 0); normalised → (2, 1, 0) / √5.
+        let expected = normalize3([2.0, 1.0, 0.0]);
+        for i in 0..3 {
+            assert!(
+                (n_after[i] - expected[i]).abs() < 1e-5,
+                "component {i}: got {}, expected {}",
+                n_after[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn inverse_transpose_pure_rotation_equals_matrix() {
+        // For orthonormal rotation-only matrices, inverse-transpose
+        // = original. 90° around Y: X axis → -Z, Z axis → +X.
+        let m = Mat4 {
+            cols: [
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let inv_t = inverse_transpose_upper3x3(&m);
+        let original: [[f32; 3]; 3] = [
+            [m.cols[0][0], m.cols[0][1], m.cols[0][2]],
+            [m.cols[1][0], m.cols[1][1], m.cols[1][2]],
+            [m.cols[2][0], m.cols[2][1], m.cols[2][2]],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (inv_t[i][j] - original[i][j]).abs() < 1e-5,
+                    "mismatch at [{i}][{j}]: {} vs {}",
+                    inv_t[i][j],
+                    original[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_by_name_finds_matching_node() {
+        let scene = GltfScene {
+            nodes: vec![
+                GltfNode {
+                    name: Some("root".into()),
+                    parent: None,
+                    children: vec![],
+                    mesh: None,
+                    skin: None,
+                    transform: NodeTransform::Trs {
+                        translation: [0.0; 3],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        scale: [1.0; 3],
+                    },
+                },
+                GltfNode {
+                    name: Some("turbine_L".into()),
+                    parent: None,
+                    children: vec![],
+                    mesh: None,
+                    skin: None,
+                    transform: NodeTransform::Trs {
+                        translation: [0.0; 3],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        scale: [1.0; 3],
+                    },
+                },
+            ],
+            meshes: vec![],
+            skeletons: vec![],
+            animations: vec![],
+            root_nodes: vec![0],
+        };
+        assert_eq!(scene.node_by_name("turbine_L"), Some(1));
+        assert_eq!(scene.node_by_name("nonexistent"), None);
     }
 }
