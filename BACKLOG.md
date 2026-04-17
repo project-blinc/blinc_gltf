@@ -77,10 +77,11 @@ and **how** to approach it so items are pickable cold.
   - **How:** Requires a KTX2 decoder (`basisuniversal` via `basis-universal-rs`
     or similar). Feature-gated.
 
-- [ ] **Inverse-transpose for non-uniform-scale normals**
-  - Current `bake_transform` applies the full 4×4 to normals, which
-    distorts them under non-uniform scale. Use the upper-3×3's
-    inverse-transpose. Trivial change once a helper exists.
+- [x] **Inverse-transpose for non-uniform-scale normals.**
+  `bake_transform` now computes `inverse_transpose_upper3x3(m)` and
+  routes normals + tangent-xyz through it. Degenerate matrices
+  (|det| < 1e-8) fall back to the plain upper-3×3 so assets with a
+  zero-scale axis degrade gracefully rather than blowing up.
 
 ---
 
@@ -102,10 +103,12 @@ and **how** to approach it so items are pickable cold.
     two joints (legal but rare), the deeper joint reads as a root.
     Fix: walk the full node parent chain during skin parse.
 
-- [ ] **Node names as a lookup table**
-  - Add `GltfScene::node_by_name(&str) -> Option<usize>` for
-    downstream code that wants to pin runtime behavior to AE / Blender
-    node names.
+- [x] **Node names as a lookup table.**
+  `GltfScene::node_by_name(&str) -> Option<usize>` — O(n) scan that
+  returns the first match, consistent with how DCC tools name
+  nodes. Downstream demos can replace manual `enumerate +
+  filter_map` name scans (buster_drone's rotor subtree, lens
+  emissive) with the one-liner once we use it in the demo.
 
 ---
 
