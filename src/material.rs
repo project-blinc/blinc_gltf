@@ -7,6 +7,78 @@
 
 use blinc_core::draw::{AlphaMode, Material, TextureData};
 
+/// Coarse bucketing of a base-color texture's alpha distribution,
+/// used by the auto-demote heuristic in [`parse_material`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlphaClass {
+    /// Texture alpha is effectively a cutout — every sampled texel
+    /// sits near 0 or near 1. BLEND authors targeting this kind of
+    /// material are almost always wrong, because a proper alpha
+    /// blend here produces the same silhouette as alpha-test at
+    /// non-trivial depth-ordering cost.
+    Binary,
+    /// Significant fraction of texels fall in the soft middle band.
+    /// Legitimate transparency — feathered decals, particle sprites,
+    /// glass gradients, light falloff. Keep BLEND.
+    Soft,
+    /// No texture, no alpha channel, or not enough samples to decide.
+    /// Callers treat this as "defer to the author" (keep BLEND).
+    Unknown,
+}
+
+/// Scan a base-color texture's alpha channel and bucket the result.
+///
+/// Samples a bounded subset of pixels (capped around 4096 regardless
+/// of texture size) and counts how many land in the "soft" middle
+/// band `(0.1, 0.9)`. Below a 5% soft ratio the texture is
+/// [`AlphaClass::Binary`]; otherwise [`AlphaClass::Soft`].
+///
+/// Called at parse time. Runtime cost is a single strided scan — at
+/// most a few thousand byte reads per BLEND material.
+fn classify_alpha(tex: Option<&TextureData>) -> AlphaClass {
+    let Some(tex) = tex else {
+        return AlphaClass::Unknown;
+    };
+    let Some(bytes_present) = tex.with_bytes(|b| b.len()) else {
+        return AlphaClass::Unknown;
+    };
+    if bytes_present < 4 {
+        return AlphaClass::Unknown;
+    }
+    let texel_count = bytes_present / 4;
+    // Cap samples to bound the scan (4K² RGBA is 16M texels; 4k
+    // samples is plenty for a noise-bucket classification).
+    const MAX_SAMPLES: usize = 4096;
+    const LO: u8 = 25; // ≈ alpha 0.1
+    const HI: u8 = 230; // ≈ alpha 0.9
+    let stride = (texel_count / MAX_SAMPLES).max(1);
+    let (mut soft, mut total) = (0usize, 0usize);
+    let res = tex.with_bytes(|bytes| {
+        let mut i = 0;
+        while i < texel_count {
+            let a = bytes[i * 4 + 3];
+            if a > LO && a < HI {
+                soft += 1;
+            }
+            total += 1;
+            i += stride;
+        }
+        (soft, total)
+    });
+    let Some((soft, total)) = res else {
+        return AlphaClass::Unknown;
+    };
+    if total < 16 {
+        return AlphaClass::Unknown;
+    }
+    let soft_ratio = soft as f32 / total as f32;
+    if soft_ratio < 0.05 {
+        AlphaClass::Binary
+    } else {
+        AlphaClass::Soft
+    }
+}
+
 /// Decode a glTF material into Blinc's `Material`.
 ///
 /// `decoded_images[i]` must hold the pre-decoded texture for glTF
@@ -58,6 +130,24 @@ pub fn parse_material(
         emissive_factor[2] * emissive_strength,
     ];
 
+    // Resolve the authored alpha mode once, then auto-demote based
+    // on the base-color texture's alpha distribution. See
+    // `classify_alpha` for rationale — done before the struct
+    // literal so we can still borrow base_color_texture freely.
+    let authored_alpha_mode = match mat.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+        gltf::material::AlphaMode::Mask => AlphaMode::Mask,
+        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    };
+    let resolved_alpha_mode = if authored_alpha_mode == AlphaMode::Blend {
+        match classify_alpha(base_color_texture.as_ref()) {
+            AlphaClass::Binary => AlphaMode::Mask,
+            AlphaClass::Soft | AlphaClass::Unknown => AlphaMode::Blend,
+        }
+    } else {
+        authored_alpha_mode
+    };
+
     Material {
         base_color: pbr.base_color_factor(),
         metallic: pbr.metallic_factor(),
@@ -86,13 +176,10 @@ pub fn parse_material(
         displacement_map: None,
         displacement_scale: 0.0,
         unlit: mat.unlit(),
-        alpha_mode: match mat.alpha_mode() {
-            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-            gltf::material::AlphaMode::Mask => AlphaMode::Mask,
-            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
-        },
+        alpha_mode: resolved_alpha_mode,
         // glTF's `alphaCutoff` — only meaningful when alpha_mode is
         // Mask. Absent from the JSON means "use the spec default 0.5".
+        // The same value is used when we auto-demote BLEND → MASK.
         alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
         // Shadows on by default. Blinc's mesh pipeline does
         // two-phase shadow mapping: one depth pass over every caster
