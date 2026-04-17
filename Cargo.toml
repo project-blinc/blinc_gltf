@@ -25,12 +25,12 @@ categories = ["rendering::data-formats", "graphics"]
 #     blinc_platform = { path = "crates/blinc_platform" }
 #
 # Bump these revs in lockstep with the Blinc repo's `main`.
-blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "7c8dc8f5f4a014e8136355b6a06e5e2c4d0d0d9e" }
-blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "7c8dc8f5f4a014e8136355b6a06e5e2c4d0d0d9e" }
+blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117" }
+blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117" }
 # Optional cross-platform asset loader integration. Gated behind the
 # `platform-assets` feature so pure-desktop users can keep depending
 # on `std::fs` via `load_path` without pulling in the platform crate.
-blinc_platform = { git = "https://github.com/project-blinc/Blinc.git", rev = "7c8dc8f5f4a014e8136355b6a06e5e2c4d0d0d9e", optional = true }
+blinc_platform = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117", optional = true }
 
 # Upstream glTF parser. Covers JSON + .glb, accessor decoding, external
 # buffer loading, image decoding via optional features.
