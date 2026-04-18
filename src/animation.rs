@@ -89,7 +89,10 @@ pub(crate) fn parse_animation(
     }
 }
 
-fn parse_channel(ch: &gltf::animation::Channel, buffers: &[gltf::buffer::Data]) -> AnimationChannel {
+fn parse_channel(
+    ch: &gltf::animation::Channel,
+    buffers: &[gltf::buffer::Data],
+) -> AnimationChannel {
     let reader = ch.reader(|b| Some(&buffers[b.index()].0));
     let times: Vec<f32> = reader
         .read_inputs()
@@ -98,24 +101,32 @@ fn parse_channel(ch: &gltf::animation::Channel, buffers: &[gltf::buffer::Data]) 
 
     let (values, property) = match reader.read_outputs() {
         Some(outputs) => match outputs {
-            gltf::animation::util::ReadOutputs::Translations(iter) => {
-                (KeyframeValues::Vec3(iter.collect()), AnimatedProperty::Translation)
-            }
+            gltf::animation::util::ReadOutputs::Translations(iter) => (
+                KeyframeValues::Vec3(iter.collect()),
+                AnimatedProperty::Translation,
+            ),
             gltf::animation::util::ReadOutputs::Rotations(r) => {
                 // `r.into_f32()` yields per-keyframe `[x, y, z, w]`
                 // quaternions regardless of the source component
                 // type (u8/i8/u16/i16/f32 are all valid in glTF).
-                (KeyframeValues::Vec4(r.into_f32().collect()), AnimatedProperty::Rotation)
+                (
+                    KeyframeValues::Vec4(r.into_f32().collect()),
+                    AnimatedProperty::Rotation,
+                )
             }
-            gltf::animation::util::ReadOutputs::Scales(iter) => {
-                (KeyframeValues::Vec3(iter.collect()), AnimatedProperty::Scale)
-            }
+            gltf::animation::util::ReadOutputs::Scales(iter) => (
+                KeyframeValues::Vec3(iter.collect()),
+                AnimatedProperty::Scale,
+            ),
             gltf::animation::util::ReadOutputs::MorphTargetWeights(w) => (
                 KeyframeValues::Scalars(w.into_f32().collect()),
                 AnimatedProperty::MorphWeights,
             ),
         },
-        None => (KeyframeValues::Scalars(Vec::new()), AnimatedProperty::Translation),
+        None => (
+            KeyframeValues::Scalars(Vec::new()),
+            AnimatedProperty::Translation,
+        ),
     };
 
     let interpolation = match ch.sampler().interpolation() {

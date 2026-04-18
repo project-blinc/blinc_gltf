@@ -49,12 +49,9 @@ pub fn parse_primitive(
         .read_colors(0)
         .map(|iter| iter.into_rgba_f32().collect());
     let tangents: Option<Vec<[f32; 4]>> = reader.read_tangents().map(|iter| iter.collect());
-    let joints: Option<Vec<[u16; 4]>> = reader
-        .read_joints(0)
-        .map(|iter| iter.into_u16().collect());
-    let weights: Option<Vec<[f32; 4]>> = reader
-        .read_weights(0)
-        .map(|iter| iter.into_f32().collect());
+    let joints: Option<Vec<[u16; 4]>> = reader.read_joints(0).map(|iter| iter.into_u16().collect());
+    let weights: Option<Vec<[f32; 4]>> =
+        reader.read_weights(0).map(|iter| iter.into_f32().collect());
 
     // ── Vertex assembly ──────────────────────────────────────────────
     //
@@ -79,7 +76,12 @@ pub fn parse_primitive(
             v.tangent = ts[i];
         }
         if let Some(js) = &joints {
-            v.joints = [js[i][0] as u32, js[i][1] as u32, js[i][2] as u32, js[i][3] as u32];
+            v.joints = [
+                js[i][0] as u32,
+                js[i][1] as u32,
+                js[i][2] as u32,
+                js[i][3] as u32,
+            ];
         }
         if let Some(ws) = &weights {
             v.weights = ws[i];
@@ -107,9 +109,7 @@ pub fn parse_primitive(
     let morph_targets: Vec<blinc_core::draw::MorphTarget> = reader
         .read_morph_targets()
         .map(|(pos, nrm, tan)| {
-            let delta_positions: Vec<[f32; 3]> = pos
-                .map(|iter| iter.collect())
-                .unwrap_or_default();
+            let delta_positions: Vec<[f32; 3]> = pos.map(|iter| iter.collect()).unwrap_or_default();
             let delta_normals: Option<Vec<[f32; 3]>> = nrm.map(|iter| iter.collect());
             let delta_tangents: Option<Vec<[f32; 3]>> = tan.map(|iter| iter.collect());
             blinc_core::draw::MorphTarget {

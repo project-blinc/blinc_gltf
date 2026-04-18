@@ -93,8 +93,26 @@ and **how** to approach it so items are pickable cold.
 - [ ] **KTX2 / BasisU textures** (`KHR_texture_basisu`)
   - **Why:** Fraction of PNG/JPEG decode time; GPU-ready block
     compression. Universal texture format for delivery.
-  - **How:** Requires a KTX2 decoder (`basisuniversal` via `basis-universal-rs`
-    or similar). Feature-gated.
+  - **How:** Requires a KTX2 decoder (`basisuniversal` via
+    `basis-universal-rs` or similar). Feature-gated. Stacks on top
+    of the runtime BC pipeline below — pre-compressed KTX2
+    deliveries would skip the encoder and feed
+    `TextureData::new_compressed` directly.
+
+- [x] **Runtime BC texture encoding** (BC1 / BC3 / BC4 / BC5). Feature
+  `bc-encode` gates a pure-Rust `tbc`-backed encoder that runs in
+  `parse_material`: diffuse → BC1 or BC3 (alpha-profile-driven),
+  normals → BC5 (shader reconstructs B from RG), occlusion → BC4
+  on the red channel. Emits `TextureData` with the corresponding
+  `TexturePixelFormat` variant for `blinc_gpu::GpuImage::from_compressed`
+  to upload. On the strangler rig (~29 textures at 2K × 2K): GPU
+  VRAM dropped ~4-6× for the affected slots; process Physical
+  footprint 572 MB → 497 MB steady, peak 1.7 GB → 1.4 GB (the
+  peak drop is from the zero-copy `&[u8] → &[Rgba8]` cast
+  eliminating encoder transients). Metallic-roughness and
+  emissive slots still upload Rgba8 — MR's glTF channel layout
+  (AO.r, roughness.g, metallic.b) isn't a clean fit for any
+  single BC format without a channel rebake.
 
 - [x] **Inverse-transpose for non-uniform-scale normals.**
   `bake_transform` now computes `inverse_transpose_upper3x3(m)` and
