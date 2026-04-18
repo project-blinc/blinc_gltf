@@ -55,6 +55,8 @@ use blinc_core::draw::MeshData;
 use blinc_core::Mat4;
 
 mod animation;
+#[cfg(feature = "bc-encode")]
+mod bc_encode;
 mod material;
 mod mesh;
 mod node;
@@ -228,10 +230,7 @@ pub fn load_asset(path: &str) -> Result<GltfScene, Error> {
 /// Same as [`load_asset`] but applies the transforms configured in
 /// `opts` (texture downsampling, future knobs).
 #[cfg(feature = "platform-assets")]
-pub fn load_asset_with_options(
-    path: &str,
-    opts: &LoadOptions,
-) -> Result<GltfScene, Error> {
+pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfScene, Error> {
     let bytes = blinc_platform::assets::load_asset(path)
         .map_err(|e| Error::Invalid(format!("asset load '{}': {}", path, e)))?;
 
@@ -303,8 +302,7 @@ fn downsample_images(images: &mut [gltf::image::Data], max: u32) {
         let scale = max as f32 / longer as f32;
         let new_w = ((img.width as f32 * scale).round() as u32).max(1);
         let new_h = ((img.height as f32 * scale).round() as u32).max(1);
-        let resized =
-            dynimg.resize(new_w, new_h, image::imageops::FilterType::Triangle);
+        let resized = dynimg.resize(new_w, new_h, image::imageops::FilterType::Triangle);
         img.pixels = resized.to_rgba8().into_raw();
         img.width = new_w;
         img.height = new_h;
@@ -407,8 +405,12 @@ fn resolve_images(
         // mime type is missing — glTF allows either, and the image
         // crate's own `guess_format` handles png/jpg cleanly.
         let decoded = match mime {
-            Some("image/png") => image::load_from_memory_with_format(&encoded, image::ImageFormat::Png),
-            Some("image/jpeg") => image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg),
+            Some("image/png") => {
+                image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)
+            }
+            Some("image/jpeg") => {
+                image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
+            }
             _ => image::load_from_memory(&encoded),
         }
         .map_err(|e| Error::Invalid(format!("image decode: {}", e)))?;
@@ -484,10 +486,7 @@ fn from_import(
         .map(|s| s.nodes().map(|n| n.index()).collect())
         .unwrap_or_default();
 
-    let skeletons = doc
-        .skins()
-        .map(|s| skin::parse_skin(&s, buffers))
-        .collect();
+    let skeletons = doc.skins().map(|s| skin::parse_skin(&s, buffers)).collect();
 
     let animations = doc
         .animations()

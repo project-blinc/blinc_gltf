@@ -75,6 +75,16 @@ thiserror = "2.0"
 # runs don't pay for it unless `RUST_LOG` opts in.
 tracing = "0.1"
 
+# Pure-Rust Texture Block Compression encoder (BC1 / BC3 / BC4).
+# Opt-in via the `bc-encode` feature — off by default because BC
+# encoding adds ~50-150 ms per 2K × 2K texture to async load. The
+# feature's payoff is ~4-8× smaller GPU VRAM for material textures
+# (see `docs/book/src/advanced/3d-rendering.md`). Pure Rust so the
+# crate still compiles for wasm32 targets; the renderer's runtime
+# capability probe decides whether to actually upload the BC
+# payload or fall back to Rgba8.
+tbc = { version = "0.3", optional = true }
+
 [features]
 default = []
 # Enables `load_asset()` — cross-platform glTF loading via the global
@@ -82,3 +92,10 @@ default = []
 # thin wrapper around the `gltf` parser for callers who want their own
 # asset pipeline.
 platform-assets = ["dep:blinc_platform"]
+# Enables runtime BC1/BC3/BC4 encoding of decoded glTF textures,
+# feeding `blinc_gpu::GpuImage::from_compressed`. Diffuse textures
+# encode to BC1 (opaque) or BC3 (alpha) based on the alpha
+# histogram used by the existing demotion heuristic; occlusion
+# textures encode to BC4. Normal maps and metallic-roughness stay
+# Rgba8 in this revision — BC5 support lands separately.
+bc-encode = ["dep:tbc"]

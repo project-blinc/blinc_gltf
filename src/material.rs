@@ -78,10 +78,7 @@ fn analyze_alpha_distribution(tex: &TextureData) -> Option<AlphaProfile> {
 /// 4K × 4K RGBA image that's referenced by ten materials exists exactly
 /// once in memory — `TextureData::clone()` is a refcount bump on the
 /// underlying `Arc<[u8]>`.
-pub fn parse_material(
-    mat: &gltf::Material,
-    decoded_images: &[Option<TextureData>],
-) -> Material {
+pub fn parse_material(mat: &gltf::Material, decoded_images: &[Option<TextureData>]) -> Material {
     let tex = |idx: usize| decoded_images.get(idx).and_then(|t| t.clone());
     let pbr = mat.pbr_metallic_roughness();
 
@@ -147,10 +144,7 @@ pub fn parse_material(
     let occlusion_texture = occlusion_info
         .as_ref()
         .and_then(|info| tex(info.texture().source().index()));
-    let occlusion_strength = occlusion_info
-        .as_ref()
-        .map(|o| o.strength())
-        .unwrap_or(1.0);
+    let occlusion_strength = occlusion_info.as_ref().map(|o| o.strength()).unwrap_or(1.0);
     let emissive_texture = mat
         .emissive_texture()
         .and_then(|info| tex(info.texture().source().index()));
@@ -210,9 +204,7 @@ pub fn parse_material(
     let (resolved_alpha_mode, demote_reason) = match authored_alpha_mode {
         gltf::material::AlphaMode::Opaque => (AlphaMode::Opaque, None),
         gltf::material::AlphaMode::Mask => (AlphaMode::Mask, None),
-        gltf::material::AlphaMode::Blend if effective_factor_a < 0.99 => {
-            (AlphaMode::Blend, None)
-        }
+        gltf::material::AlphaMode::Blend if effective_factor_a < 0.99 => (AlphaMode::Blend, None),
         gltf::material::AlphaMode::Blend => {
             let profile = base_color_texture
                 .as_ref()
@@ -222,21 +214,39 @@ pub fn parse_material(
                 Some(AlphaProfile::Opaque) => {
                     (AlphaMode::Opaque, Some("texture ≥95% fully-opaque"))
                 }
-                Some(AlphaProfile::Binary) => {
-                    (AlphaMode::Mask, Some("texture strictly binary α"))
-                }
+                Some(AlphaProfile::Binary) => (AlphaMode::Mask, Some("texture strictly binary α")),
                 Some(AlphaProfile::Partial) => (AlphaMode::Blend, None),
             }
         }
     };
 
-    tracing::info!(
+    tracing::debug!(
         material = mat.name().unwrap_or("<unnamed>"),
         authored = ?authored_alpha_mode,
         resolved = ?resolved_alpha_mode,
         factor_a = effective_factor_a,
         demote_reason,
         "parsed material"
+    );
+
+    // Block-compress diffuse + normal + occlusion textures when
+    // the `bc-encode` feature is on. Done late (after the demotion
+    // decision) so we can pick BC1 for Opaque-resolved diffuse and
+    // BC3 for Blend/Mask-resolved diffuse. Other slots (MR,
+    // emissive) stay Rgba8 in this revision — MR would benefit
+    // from BC5 or a pair of BC4 channel packs but the existing
+    // glTF MR layout (occlusion.r, roughness.g, metallic.b) isn't
+    // a clean fit for either BC format without a channel rebake.
+    //
+    // Keeping the legacy Rgba8 path when the feature is off — same
+    // TextureData shape flowing into the mesh pipeline, just
+    // larger.
+    #[cfg(feature = "bc-encode")]
+    let (base_color_texture, normal_map, occlusion_texture) = compress_textures(
+        base_color_texture,
+        normal_map,
+        occlusion_texture,
+        resolved_alpha_mode,
     );
 
     Material {
@@ -284,6 +294,66 @@ pub fn parse_material(
         receives_shadows: true,
         casts_shadows: true,
     }
+}
+
+/// Encode diffuse, normal-map, and occlusion slots into
+/// block-compressed variants based on the material's resolved
+/// alpha mode.
+///
+/// - Diffuse + `AlphaMode::Opaque` → BC1 (4 bpp, sRGB)
+/// - Diffuse + `AlphaMode::Mask` or `AlphaMode::Blend`
+///   → BC3 (8 bpp, sRGB)
+/// - Normal map → BC5 (8 bpp, linear; shader reconstructs B from RG)
+/// - Occlusion → BC4 on the red channel (4 bpp, linear)
+///
+/// Returns the possibly-reassigned textures. When the CPU bytes
+/// aren't available (for example the `TextureData` was already
+/// GPU-uploaded and `drop_cpu_bytes` was called — doesn't happen
+/// during material parse but future-proofs against it), falls
+/// back to returning the original Rgba8 texture unchanged.
+///
+/// Only compiled when the `bc-encode` cargo feature is enabled.
+#[cfg(feature = "bc-encode")]
+fn compress_textures(
+    base_color: Option<TextureData>,
+    normal: Option<TextureData>,
+    occlusion: Option<TextureData>,
+    resolved_alpha_mode: AlphaMode,
+) -> (
+    Option<TextureData>,
+    Option<TextureData>,
+    Option<TextureData>,
+) {
+    let encode_one =
+        |td: &TextureData, kind: fn(&[u8], u32, u32) -> TextureData| -> Option<TextureData> {
+            if td.format.is_compressed() {
+                // Already compressed by a caller or a previous pass —
+                // don't re-encode.
+                return None;
+            }
+            let w = td.width;
+            let h = td.height;
+            td.with_bytes(|bytes| kind(bytes, w, h))
+        };
+
+    let new_base = base_color.as_ref().and_then(|td| {
+        let kind = match resolved_alpha_mode {
+            AlphaMode::Opaque => crate::bc_encode::encode_bc1,
+            AlphaMode::Mask | AlphaMode::Blend => crate::bc_encode::encode_bc3,
+        };
+        encode_one(td, kind)
+    });
+    let new_normal = normal
+        .as_ref()
+        .and_then(|td| encode_one(td, crate::bc_encode::encode_bc5_rg));
+    let new_occl = occlusion
+        .as_ref()
+        .and_then(|td| encode_one(td, crate::bc_encode::encode_bc4_red));
+    (
+        new_base.or(base_color),
+        new_normal.or(normal),
+        new_occl.or(occlusion),
+    )
 }
 
 /// Convert a decoded glTF image into Blinc's [`TextureData`].
