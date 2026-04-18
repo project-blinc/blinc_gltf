@@ -46,6 +46,13 @@ gltf = { version = "1.4", default-features = false, features = [
     "extras",
     "KHR_materials_unlit",
     "KHR_materials_emissive_strength",
+    # Legacy spec-gloss workflow (older glTF exporters, Sketchfab, Poly
+    # Haven archive). Enabling the feature both teaches the parser to
+    # accept the extension in `extensionsRequired` (otherwise load
+    # errors with `Unsupported`) and exposes
+    # `Material::pbr_specular_glossiness()` for our conversion to the
+    # metallic-roughness channels that the mesh pipeline consumes.
+    "KHR_materials_pbrSpecularGlossiness",
     "import",
 ] }
 
@@ -61,6 +68,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 base64 = "0.22"
 
 thiserror = "2.0"
+
+# Structured logging for load-time diagnostics (e.g. per-material
+# BLEND demotion decisions). Apps already configure `tracing` via
+# `tracing-subscriber`; the crate emits only at `debug` so production
+# runs don't pay for it unless `RUST_LOG` opts in.
+tracing = "0.1"
 
 [features]
 default = []

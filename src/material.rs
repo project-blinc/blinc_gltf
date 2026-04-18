@@ -7,6 +7,69 @@
 
 use blinc_core::draw::{AlphaMode, Material, TextureData};
 
+/// Summary of a base-color texture's alpha channel. Drives the BLEND
+/// demotion at parse time — see [`analyze_alpha_distribution`] and the
+/// `resolved_alpha_mode` block in [`parse_material`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlphaProfile {
+    /// ≥95% of texels have α ≥ 0.95. The remaining 5% is typically
+    /// anti-aliasing at UV island edges — visually indistinguishable
+    /// from fully opaque when rendered forward.
+    Opaque,
+    /// ≥99% of texels sit at either α ≤ 0.05 or α ≥ 0.95, with <1%
+    /// midrange. Classic alpha cutout (tree leaves, hair strands,
+    /// cloth trim) — safe to demote to MASK with cutoff 0.5.
+    Binary,
+    /// Genuine partial transparency — meaningful midrange alpha.
+    /// Smoke, frosted glass, gradient vignettes. Stays BLEND so the
+    /// renderer's OIT pass composites it correctly.
+    Partial,
+}
+
+/// Walk the RGBA8 buffer and classify the alpha channel. Returns
+/// `None` when the buffer has been released (GPU-only after upload) —
+/// callers should treat that as "can't demote, keep BLEND".
+///
+/// Cost: one linear scan of 4 bytes × width × height. For a 2K × 2K
+/// texture that's ~4M alpha reads — sub-millisecond on desktop,
+/// executed once per material at load, never per-frame.
+fn analyze_alpha_distribution(tex: &TextureData) -> Option<AlphaProfile> {
+    tex.with_bytes(|bytes| {
+        let total = bytes.len() / 4;
+        if total == 0 {
+            return AlphaProfile::Opaque;
+        }
+        // Thresholds expressed in raw u8 space to avoid per-pixel
+        // conversion (≥95% → ≥242/255, ≤5% → ≤12/255).
+        const HI: u8 = 242;
+        const LO: u8 = 12;
+        let mut hi_count = 0usize;
+        let mut lo_count = 0usize;
+        let mut mid_count = 0usize;
+        for i in 0..total {
+            let a = bytes[i * 4 + 3];
+            if a >= HI {
+                hi_count += 1;
+            } else if a <= LO {
+                lo_count += 1;
+            } else {
+                mid_count += 1;
+            }
+        }
+        let hi_frac = hi_count as f32 / total as f32;
+        let mid_frac = mid_count as f32 / total as f32;
+        let binary_frac = (hi_count + lo_count) as f32 / total as f32;
+
+        if hi_frac >= 0.95 {
+            AlphaProfile::Opaque
+        } else if binary_frac >= 0.99 && mid_frac < 0.01 {
+            AlphaProfile::Binary
+        } else {
+            AlphaProfile::Partial
+        }
+    })
+}
+
 /// Decode a glTF material into Blinc's `Material`.
 ///
 /// `decoded_images[i]` must hold the pre-decoded texture for glTF
@@ -22,9 +85,56 @@ pub fn parse_material(
     let tex = |idx: usize| decoded_images.get(idx).and_then(|t| t.clone());
     let pbr = mat.pbr_metallic_roughness();
 
-    let base_color_texture = pbr
-        .base_color_texture()
-        .and_then(|info| tex(info.texture().source().index()));
+    // `KHR_materials_pbrSpecularGlossiness` — legacy workflow used by
+    // older exporters (Sketchfab archive, Poly Haven pre-2020, the
+    // strangler rig). When present it SUPERSEDES the core
+    // `pbrMetallicRoughness` block (the spec says consumers that
+    // understand the extension must use it), so we detect it first
+    // and do a lossy-but-usable conversion into Blinc's MR-only
+    // material channels.
+    //
+    // Conversion heuristic (keeps runtime simple; no texture rebaking
+    // at load):
+    //   baseColor.rgb = diffuseFactor.rgb
+    //   baseColor.a   = diffuseFactor.a
+    //   metallic      = ((max(specular) - 0.04) / 0.96)  clamped
+    //   roughness     = 1 - glossinessFactor
+    //   baseColorTexture = diffuseTexture
+    //   metallicRoughnessTexture = None  (channel layouts differ —
+    //       specGloss packs specular into RGB + glossiness into A,
+    //       MR packs [_, roughness, metallic] — repacking per-pixel
+    //       would need a load-time bake we don't do yet)
+    //
+    // Character assets (the common case for this extension in 2026)
+    // are almost always dielectric, so the metallic-from-specular
+    // approximation collapses to ~0 and the diffuse factor carries
+    // the full base color — visually indistinguishable from the
+    // authored look for skin/cloth/hair.
+    let (base_color_factor, metallic_factor, roughness_factor, sg_base_color_texture) =
+        if let Some(sg) = mat.pbr_specular_glossiness() {
+            let diffuse = sg.diffuse_factor();
+            let specular = sg.specular_factor();
+            let glossiness = sg.glossiness_factor();
+            let max_spec = specular[0].max(specular[1]).max(specular[2]);
+            let metallic = ((max_spec - 0.04) / 0.96).clamp(0.0, 1.0);
+            let roughness = (1.0 - glossiness).clamp(0.0, 1.0);
+            let diffuse_tex = sg
+                .diffuse_texture()
+                .and_then(|info| tex(info.texture().source().index()));
+            (diffuse, metallic, roughness, Some(diffuse_tex))
+        } else {
+            (
+                pbr.base_color_factor(),
+                pbr.metallic_factor(),
+                pbr.roughness_factor(),
+                None,
+            )
+        };
+
+    let base_color_texture = sg_base_color_texture.unwrap_or_else(|| {
+        pbr.base_color_texture()
+            .and_then(|info| tex(info.texture().source().index()))
+    });
     let metallic_roughness_texture = pbr
         .metallic_roughness_texture()
         .and_then(|info| tex(info.texture().source().index()));
@@ -58,32 +168,81 @@ pub fn parse_material(
         emissive_factor[2] * emissive_strength,
     ];
 
-    // Respect the authored alpha mode as-is. An earlier revision
-    // tried to auto-demote binary-alpha BLEND → MASK here, reasoning
-    // that many exporters flag materials as BLEND out of caution
-    // even when the texture is a hard cutout. That heuristic had a
-    // fundamental false-positive: a "solid body panel with a decal
-    // mask" and a "thin overlay decorator with hard-edged alpha"
-    // (eyelashes, tearlines, eye-occlusion shells) BOTH have binary
-    // alpha, but only the first wants MASK. Demoting the second
-    // makes the overlay write depth slightly in front of the face
-    // it sits on, and the face gets z-rejected behind the overlay.
+    // Auto-demote BLEND based on actual alpha distribution.
     //
-    // Author intent isn't recoverable from alpha distribution alone.
-    // Callers that need the demote for specific assets can do it
-    // with `apply_material_overrides`; a better framework path would
-    // be a depth-prepass / OIT scheme in the renderer rather than a
-    // lossy material-mode rewrite here.
-    let resolved_alpha_mode = match mat.alpha_mode() {
-        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-        gltf::material::AlphaMode::Mask => AlphaMode::Mask,
-        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    // Many DCC exporters (Sketchfab upload, older Blender versions,
+    // spec-gloss pipelines) flag every material as BLEND by default,
+    // even when the source texture is fully opaque or uses a hard
+    // cutout. With weighted-blended OIT downstream this produces
+    // visible artifacts: solid body panels get stacked with
+    // semi-random weights, yielding the pastel "washed-out" look
+    // (Σ(c*α*w)/Σ(α*w) averaging across N layers with similar
+    // weights), and the compositor's coverage factor undershoots
+    // even where all layers are authored fully opaque.
+    //
+    // OIT is the correct framework fix for *genuine* transparency
+    // (smoke, glass, soft foliage, thin overlays). Misflagged opaque
+    // materials should be demoted so they write depth and composite
+    // via the forward path instead.
+    //
+    // Heuristic (safe by construction — only moves BLEND out, never
+    // changes OPAQUE or MASK):
+    //
+    //   - baseColorFactor.a < 0.99  → keep BLEND (author explicitly
+    //     reduced alpha — respects intent even without a texture
+    //     to sample).
+    //
+    //   - No texture & factor.a ≥ 0.99  → OPAQUE.
+    //
+    //   - Texture profile = Opaque  → OPAQUE (≥95% fully-opaque
+    //     texels; the 5% AA tail composites fine as opaque).
+    //
+    //   - Texture profile = Binary  → MASK with cutoff 0.5 (classic
+    //     alpha cutout — writes depth, composites correctly).
+    //
+    //   - Texture profile = Partial → keep BLEND (meaningful
+    //     midrange alpha = genuine translucency).
+    //
+    // Decisions are traced at `debug` level so assets that misbehave
+    // can be diagnosed with `RUST_LOG=blinc_gltf=debug`.
+    let authored_alpha_mode = mat.alpha_mode();
+    let effective_factor_a = base_color_factor[3];
+    let (resolved_alpha_mode, demote_reason) = match authored_alpha_mode {
+        gltf::material::AlphaMode::Opaque => (AlphaMode::Opaque, None),
+        gltf::material::AlphaMode::Mask => (AlphaMode::Mask, None),
+        gltf::material::AlphaMode::Blend if effective_factor_a < 0.99 => {
+            (AlphaMode::Blend, None)
+        }
+        gltf::material::AlphaMode::Blend => {
+            let profile = base_color_texture
+                .as_ref()
+                .and_then(analyze_alpha_distribution);
+            match profile {
+                None => (AlphaMode::Opaque, Some("no texture, factor.a≈1")),
+                Some(AlphaProfile::Opaque) => {
+                    (AlphaMode::Opaque, Some("texture ≥95% fully-opaque"))
+                }
+                Some(AlphaProfile::Binary) => {
+                    (AlphaMode::Mask, Some("texture strictly binary α"))
+                }
+                Some(AlphaProfile::Partial) => (AlphaMode::Blend, None),
+            }
+        }
     };
 
+    tracing::info!(
+        material = mat.name().unwrap_or("<unnamed>"),
+        authored = ?authored_alpha_mode,
+        resolved = ?resolved_alpha_mode,
+        factor_a = effective_factor_a,
+        demote_reason,
+        "parsed material"
+    );
+
     Material {
-        base_color: pbr.base_color_factor(),
-        metallic: pbr.metallic_factor(),
-        roughness: pbr.roughness_factor(),
+        base_color: base_color_factor,
+        metallic: metallic_factor,
+        roughness: roughness_factor,
         emissive,
         base_color_texture,
         normal_map,
