@@ -128,9 +128,22 @@ pub fn parse_material(mat: &gltf::Material, decoded_images: &[Option<TextureData
             )
         };
 
+    // Capture `base_color_texture`'s `Info` handle up front so we can
+    // read both the image index AND its `KHR_texture_transform`
+    // extension (if present) off the same call without threading a
+    // shared `Option<Info>` through the Sg/MR branches below.
+    let base_color_info = pbr.base_color_texture();
+    let texture_transform =
+        base_color_info
+            .as_ref()
+            .and_then(|info| info.texture_transform())
+            .map(|tt| blinc_core::TextureTransform {
+                offset: tt.offset(),
+                rotation: tt.rotation(),
+                scale: tt.scale(),
+            });
     let base_color_texture = sg_base_color_texture.unwrap_or_else(|| {
-        pbr.base_color_texture()
-            .and_then(|info| tex(info.texture().source().index()))
+        base_color_info.and_then(|info| tex(info.texture().source().index()))
     });
     let metallic_roughness_texture = pbr
         .metallic_roughness_texture()
@@ -293,6 +306,7 @@ pub fn parse_material(mat: &gltf::Material, decoded_images: &[Option<TextureData
         // flags via `map_material`.
         receives_shadows: true,
         casts_shadows: true,
+        texture_transform,
     }
 }
 
