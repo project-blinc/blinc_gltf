@@ -255,6 +255,185 @@ pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfSce
     from_import(&gltf_obj.document, &buffers, images)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Async entry points + progress reporting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stage of an async glTF load, reported via the progress callback
+/// passed to [`load_asset_with_options_async`].
+///
+/// Emitted in order: `WaitingOnPreload` → `Document` → `Buffers`
+/// (skipped on `.glb`) → `Images` → `Building` → `Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStage {
+    /// Platform preload hasn't populated the asset loader's cache
+    /// with the target `.gltf` / `.glb` file yet. Only reachable on
+    /// web, where [`blinc_platform::assets::load_asset`] is a
+    /// synchronous cache lookup gated on an async fetch pass.
+    WaitingOnPreload,
+    /// Reading the main `.gltf` / `.glb` bytes.
+    Document,
+    /// Resolving external buffer (`.bin`) URIs for JSON glTF.
+    Buffers,
+    /// Resolving + decoding image (PNG / JPEG) URIs.
+    Images,
+    /// Building the [`GltfScene`] from parsed document + buffers + images.
+    Building,
+    /// Load completed successfully.
+    Done,
+}
+
+/// Progress event for [`load_asset_with_options_async`]. `current` /
+/// `total` describe the current stage's work (buffers loaded, images
+/// done, etc.) when measurable; both are `0` during stages that don't
+/// partition cleanly (`Document`, `Building`).
+#[derive(Debug, Clone, Copy)]
+pub struct LoadProgress {
+    pub stage: LoadStage,
+    pub current: usize,
+    pub total: usize,
+}
+
+impl LoadProgress {
+    #[inline]
+    fn stage(stage: LoadStage) -> Self {
+        Self { stage, current: 0, total: 0 }
+    }
+}
+
+/// Async load of a glTF asset through the global
+/// [`blinc_platform::assets`] loader, with optional progress reporting.
+///
+/// Differences from the sync [`load_asset`]:
+///
+/// - **Waits for preload.** On web, [`load_asset`] fails immediately
+///   if the target file hasn't been preloaded yet. Demos work around
+///   this with a 100 ms retry polling loop plus a `preload_settled()`
+///   escape hatch. The async version folds that into the library:
+///   the future yields to the runtime until either the bytes are
+///   cached or the platform reports preload settled with the target
+///   still missing (→ `Err`).
+/// - **Yields between stages.** A minimal `YieldNow` future is
+///   awaited at each stage boundary so the runtime can paint
+///   intermediate progress UI on wasm's single-threaded executor.
+/// - **Emits progress.** `progress` is called on every stage
+///   transition. Demos can forward it into a `State<LoadProgress>`
+///   signal to drive a loading overlay.
+///
+/// Native callers can `tokio::spawn` / `async_std::task::spawn` / etc.
+/// Web callers use `wasm_bindgen_futures::spawn_local`. No runtime
+/// crate dep — `YieldNow` is a 30-line hand-rolled `Future`.
+#[cfg(feature = "platform-assets")]
+pub async fn load_asset_async(path: &str) -> Result<GltfScene, Error> {
+    load_asset_with_options_async(path, &LoadOptions::default(), |_| {}).await
+}
+
+/// Async + progress-aware variant of [`load_asset_with_options`].
+/// See [`load_asset_async`] for rationale.
+#[cfg(feature = "platform-assets")]
+pub async fn load_asset_with_options_async<P>(
+    path: &str,
+    opts: &LoadOptions,
+    mut progress: P,
+) -> Result<GltfScene, Error>
+where
+    P: FnMut(LoadProgress),
+{
+    // Phase 1: wait for platform preload to land this asset in cache.
+    // On native (`FilesystemAssetLoader`), `preload_settled()` is
+    // always `true` and `asset_exists` maps to `Path::exists`, so the
+    // loop exits on the first iteration. On web, we poll until the
+    // WebAssetLoader's preload pass inserts the bytes — then the
+    // sync `load_asset` below becomes an in-cache lookup.
+    progress(LoadProgress::stage(LoadStage::WaitingOnPreload));
+    loop {
+        if blinc_platform::assets::asset_exists(path) {
+            break;
+        }
+        if blinc_platform::assets::preload_settled() {
+            return Err(Error::Invalid(format!(
+                "asset '{path}' not in loader cache after preload settled",
+            )));
+        }
+        yield_now().await;
+    }
+
+    // Phase 2: document bytes.
+    progress(LoadProgress::stage(LoadStage::Document));
+    yield_now().await;
+    let bytes = blinc_platform::assets::load_asset(path)
+        .map_err(|e| Error::Invalid(format!("asset load '{}': {}", path, e)))?;
+
+    // GLB fast path — self-contained, no external URIs.
+    if bytes.len() >= 4 && &bytes[0..4] == b"glTF" {
+        progress(LoadProgress::stage(LoadStage::Images));
+        yield_now().await;
+        let (doc, buffers, mut images) = gltf::import_slice(&bytes)?;
+        if let Some(max) = opts.max_texture_size {
+            downsample_images(&mut images, max);
+        }
+        progress(LoadProgress::stage(LoadStage::Building));
+        yield_now().await;
+        let scene = from_import(&doc, &buffers, images)?;
+        progress(LoadProgress::stage(LoadStage::Done));
+        return Ok(scene);
+    }
+
+    // JSON glTF path.
+    let base_dir: &str = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let gltf_obj = gltf::Gltf::from_slice(&bytes)?;
+
+    progress(LoadProgress::stage(LoadStage::Buffers));
+    yield_now().await;
+    let buffers = resolve_buffers(&gltf_obj, base_dir)?;
+
+    progress(LoadProgress::stage(LoadStage::Images));
+    yield_now().await;
+    let images = resolve_images(&gltf_obj, base_dir, &buffers, opts.max_texture_size)?;
+
+    progress(LoadProgress::stage(LoadStage::Building));
+    yield_now().await;
+    let scene = from_import(&gltf_obj.document, &buffers, images)?;
+    progress(LoadProgress::stage(LoadStage::Done));
+    Ok(scene)
+}
+
+/// Cooperative-yield `Future`: `Pending` on the first poll, `Ready` on
+/// every subsequent poll. Calling `.await` on it hands control back
+/// to the runtime exactly once, then the future resumes.
+///
+/// Hand-rolled rather than pulled from `tokio` / `async-std` because
+/// `blinc_gltf` has no runtime dep — callers bring their own
+/// (`tokio::spawn`, `wasm_bindgen_futures::spawn_local`, etc.). The
+/// wasm executor re-polls pending tasks via the microtask queue, so
+/// a single `yield_now().await` between stages lets the browser
+/// paint intermediate progress UI without running an entire glTF
+/// load inside one synchronous tick.
+#[cfg(feature = "platform-assets")]
+fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
+#[cfg(feature = "platform-assets")]
+struct YieldNow(bool);
+
+#[cfg(feature = "platform-assets")]
+impl core::future::Future for YieldNow {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            core::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }
+}
+
 /// Shrink any image in `images` whose longer dimension exceeds `max`,
 /// preserving aspect. Skipped for images already at or below the cap
 /// and for source formats other than RGB8 / RGBA8 (PNG/JPEG covers the
