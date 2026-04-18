@@ -401,40 +401,72 @@ where
     Ok(scene)
 }
 
-/// Cooperative-yield `Future`: `Pending` on the first poll, `Ready` on
-/// every subsequent poll. Calling `.await` on it hands control back
-/// to the runtime exactly once, then the future resumes.
+/// Cooperative-yield future. Awaiting it hands control back to the
+/// runtime so it can process other work (UI paints, input events)
+/// before the caller resumes.
 ///
-/// Hand-rolled rather than pulled from `tokio` / `async-std` because
-/// `blinc_gltf` has no runtime dep — callers bring their own
-/// (`tokio::spawn`, `wasm_bindgen_futures::spawn_local`, etc.). The
-/// wasm executor re-polls pending tasks via the microtask queue, so
-/// a single `yield_now().await` between stages lets the browser
-/// paint intermediate progress UI without running an entire glTF
-/// load inside one synchronous tick.
-#[cfg(feature = "platform-assets")]
-fn yield_now() -> YieldNow {
-    YieldNow(false)
-}
-
-#[cfg(feature = "platform-assets")]
-struct YieldNow(bool);
-
-#[cfg(feature = "platform-assets")]
-impl core::future::Future for YieldNow {
-    type Output = ();
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<()> {
-        if self.0 {
-            core::task::Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            core::task::Poll::Pending
+/// **Platform split, critical for wasm correctness:**
+///
+/// - **Native** — a hand-rolled `Pending → immediate wake` future.
+///   Under tokio / async-std / any OS-thread-scheduled runtime this
+///   is a real yield: the scheduler drops the task back on its ready
+///   queue, other tasks run, then this one resumes on the next poll.
+/// - **Wasm** — `setTimeout(0)` via `JsFuture`. The naive
+///   `Pending → wake_by_ref` pattern schedules wakes on the browser's
+///   **microtask** queue, which runs to completion *before* the
+///   browser paints, handles input, or executes any macrotask. On a
+///   20-texture load that loops ~20 times per glTF stage, so what
+///   looks like cooperative yielding is actually a tight
+///   microtask-wake cycle that freezes the tab — page can't scroll,
+///   right-click doesn't work, the loading overlay never repaints.
+///   `setTimeout(0)` puts the continuation on the macrotask queue so
+///   the event loop actually gets a turn between decodes.
+#[cfg(all(feature = "platform-assets", not(target_arch = "wasm32")))]
+async fn yield_now() {
+    struct YieldOnce(bool);
+    impl core::future::Future for YieldOnce {
+        type Output = ();
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            if self.0 {
+                core::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
         }
     }
+    YieldOnce(false).await
+}
+
+#[cfg(all(feature = "platform-assets", target_arch = "wasm32"))]
+async fn yield_now() {
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let Some(window) = web_sys::window() else {
+        // No window (worker context?) — fall back to microtask yield.
+        // Better than nothing, even if it doesn't actually let the
+        // browser paint.
+        return;
+    };
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb: Closure<dyn FnMut()> = Closure::once(move || {
+            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            0,
+        );
+        // The Closure has to outlive the setTimeout callback it's
+        // been handed to. `forget()` leaks it intentionally — the
+        // browser will drop the reference after firing once.
+        cb.forget();
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
 /// Shrink any image in `images` whose longer dimension exceeds `max`,
