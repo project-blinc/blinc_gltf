@@ -387,12 +387,36 @@ fn resolve_images(
     use gltf::image::Format;
     use image::GenericImageView;
 
+    // A 1×1 opaque-white RGBA8 image. Used when a texture URI fails
+    // to resolve or decode so the scene as a whole still loads — a
+    // missing diffuse map falls through to `material::parse_material`
+    // and becomes an un-textured (white-tinted) primitive rather than
+    // blocking every other mesh from rendering. Mirrors the web
+    // preloader's partial-failure tolerance: one bad texture
+    // shouldn't leave the loading signal stuck forever while the
+    // rest of the scene sits ready.
+    fn placeholder() -> gltf::image::Data {
+        gltf::image::Data {
+            pixels: vec![255, 255, 255, 255],
+            format: Format::R8G8B8A8,
+            width: 1,
+            height: 1,
+        }
+    }
+
     let mut out = Vec::new();
     for image in gltf_obj.document.images() {
         let (encoded, mime): (Vec<u8>, Option<&str>) = match image.source() {
-            gltf::image::Source::Uri { uri, mime_type } => {
-                (resolve_uri_bytes(uri, base_dir)?, mime_type)
-            }
+            gltf::image::Source::Uri { uri, mime_type } => match resolve_uri_bytes(uri, base_dir) {
+                Ok(bytes) => (bytes, mime_type),
+                Err(e) => {
+                    tracing::warn!(
+                        "gltf image '{uri}' skipped ({e:?}) — substituting 1×1 placeholder"
+                    );
+                    out.push(placeholder());
+                    continue;
+                }
+            },
             gltf::image::Source::View { view, mime_type } => {
                 let buf = &buffers[view.buffer().index()].0;
                 let begin = view.offset();
@@ -412,8 +436,15 @@ fn resolve_images(
                 image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
             }
             _ => image::load_from_memory(&encoded),
-        }
-        .map_err(|e| Error::Invalid(format!("image decode: {}", e)))?;
+        };
+        let decoded = match decoded {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::warn!("gltf image decode failed ({e}) — substituting 1×1 placeholder");
+                out.push(placeholder());
+                continue;
+            }
+        };
 
         let (w, h) = decoded.dimensions();
         let pixels = decoded.to_rgba8().into_raw();
