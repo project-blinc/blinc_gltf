@@ -15,14 +15,14 @@ and **how** to approach it so items are pickable cold.
     via `reader.read_tex_coords(1)`. Renderer needs the shader change
     too.
 
-- [ ] **Morph targets**
-  - **Why:** Facial expressions, blend-shape animation, any non-skin
-    deformation.
-  - **How:** `primitive.morph_targets()` yields per-target attribute
-    deltas. Store as `Vec<MorphTarget { delta_positions, delta_normals,
-    delta_tangents }>` on the primitive. Runtime application goes to
-    `blinc_skeleton` (morph-weight channel already parsed, see
-    `AnimatedProperty::MorphWeights`).
+- [x] **Morph targets.** `parse_primitive` reads `reader
+  .read_morph_targets()` into `Vec<MorphTarget { delta_positions,
+  delta_normals, delta_tangents }>` on the primitive (wrapped in
+  `Arc<Vec>` for cheap per-frame shallow clones when the renderer
+  stamps fresh weights). Runtime sampling lives in `blinc_skeleton`
+  via `AnimatedProperty::MorphWeights`. Exercised by
+  cutegirl_morph_demo (152 targets per face primitive) and
+  strangler_demo (13 morph-weights channels for facial expression).
 
 - [ ] **Sparse accessors**
   - **Why:** Highly optimized glTF exports pack mostly-default buffers
@@ -54,10 +54,29 @@ and **how** to approach it so items are pickable cold.
     `scale`. Extend `TextureData` (or the material's texture slots)
     with a transform matrix applied in the shader.
 
-- [ ] **glTF `alphaCutoff` thread-through**
-  - Currently `Material::alpha_mode = Mask` uses the shader's fixed
-    0.5 cutoff. Extend `AlphaMode::Mask { cutoff: f32 }` or add a
-    field on `Material`.
+- [x] **glTF `alphaCutoff` thread-through.** `Material.alpha_cutoff`
+  carries the per-material cutoff (default 0.5 when absent); the
+  mesh shader reads `material.alpha_cutoff` in the MASK branch.
+
+- [x] **`KHR_materials_pbrSpecularGlossiness`** (legacy spec-gloss
+  workflow). Feature enabled on the `gltf` dep so
+  `extensionsRequired` no longer errors; `parse_material` converts
+  to metallic-roughness at load time (diffuse → baseColor, specular
+  → metallic via `(max(spec) - 0.04) / 0.96`, `1 - glossiness` →
+  roughness, diffuseTexture → baseColorTexture). Channel-accurate
+  texture re-bake is out of scope — visually indistinguishable for
+  character assets (the common case) since specular is low and the
+  factor path dominates.
+
+- [x] **Alpha-mode auto-demotion at load.** Many DCC exporters flag
+  every material as BLEND by default; weighted-blended OIT in the
+  renderer then stacks them statistically and produces washed-out
+  output. `parse_material` now analyses the base-color texture's
+  alpha histogram once on load and demotes:
+  `≥95% fully-opaque texels → OPAQUE`, `strictly binary α → MASK
+  (cutoff 0.5)`, `partial α → keep BLEND`. Decisions log at
+  `info` so misbehaving assets can be diagnosed with
+  `RUST_LOG=blinc_gltf=info`.
 
 ---
 
