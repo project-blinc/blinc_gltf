@@ -368,16 +368,22 @@ fn compress_textures(
 /// The output `rgba` buffer is wrapped in `Arc<[u8]>` so that callers
 /// can stamp the returned `TextureData` onto many materials via a
 /// cheap refcount bump.
-pub fn image_to_texture(img: &gltf::image::Data) -> Option<TextureData> {
+pub fn image_to_texture(img: gltf::image::Data) -> Option<TextureData> {
     use gltf::image::Format;
     let width = img.width;
     let height = img.height;
     let n = (width as usize) * (height as usize);
+    // Move the pixel `Vec<u8>` into the match so the RGBA8 fast
+    // path (every image that came through `resolve_images` after
+    // downsample) can hand the buffer straight to `TextureData`
+    // without cloning. The non-RGBA8 conversion paths still
+    // allocate a new `Vec` because the layout has to change;
+    // those are rare and small anyway.
     let bytes: Vec<u8> = match img.format {
         Format::R8 => expand_r_to_rgba(&img.pixels, n),
         Format::R8G8 => expand_rg_to_rgba(&img.pixels, n),
         Format::R8G8B8 => expand_rgb_to_rgba(&img.pixels, n),
-        Format::R8G8B8A8 => img.pixels.clone(),
+        Format::R8G8B8A8 => img.pixels,
         Format::R16 => downcast_r16_to_rgba(&img.pixels, n),
         Format::R16G16 => downcast_rg16_to_rgba(&img.pixels, n),
         Format::R16G16B16 => downcast_rgb16_to_rgba(&img.pixels, n),

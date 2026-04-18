@@ -170,14 +170,14 @@ pub struct GltfMesh {
 /// Parse a self-contained `.glb` blob (embedded JSON + buffers + images).
 pub fn load_glb(bytes: &[u8]) -> Result<GltfScene, Error> {
     let (doc, buffers, images) = gltf::import_slice(bytes)?;
-    from_import(&doc, &buffers, &images)
+    from_import(&doc, &buffers, images)
 }
 
 /// Parse a `.gltf` JSON file. External buffers / textures referenced
 /// via relative URIs resolve against the JSON file's parent directory.
 pub fn load_path<P: AsRef<Path>>(path: P) -> Result<GltfScene, Error> {
     let (doc, buffers, images) = gltf::import(path.as_ref())?;
-    from_import(&doc, &buffers, &images)
+    from_import(&doc, &buffers, images)
 }
 
 /// Tunables for [`load_asset_with_options`]. Everything is optional —
@@ -242,7 +242,7 @@ pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfSce
         if let Some(max) = opts.max_texture_size {
             downsample_images(&mut images, max);
         }
-        return from_import(&doc, &buffers, &images);
+        return from_import(&doc, &buffers, images);
     }
 
     // JSON glTF — parse the document first, then manually resolve
@@ -252,7 +252,7 @@ pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfSce
     let gltf_obj = gltf::Gltf::from_slice(&bytes)?;
     let buffers = resolve_buffers(&gltf_obj, base_dir)?;
     let images = resolve_images(&gltf_obj, base_dir, &buffers, opts.max_texture_size)?;
-    from_import(&gltf_obj.document, &buffers, &images)
+    from_import(&gltf_obj.document, &buffers, images)
 }
 
 /// Shrink any image in `images` whose longer dimension exceeds `max`,
@@ -525,7 +525,14 @@ fn resolve_images(
                     }
                 }
                 let (w, h) = img.dimensions();
-                let pixels = img.to_rgba8().into_raw();
+                // `into_rgba8` consumes `img` and moves the pixel
+                // buffer when the image is already RGBA8 (the
+                // common path after the resize branch above).
+                // `to_rgba8` would always clone — same 16 MB per
+                // 2K texture doubled transiently that moving the
+                // `gltf::image::Data` into `image_to_texture`
+                // already eliminated downstream.
+                let pixels = img.into_rgba8().into_raw();
                 gltf::image::Data {
                     pixels,
                     format: gltf::image::Format::R8G8B8A8,
@@ -552,14 +559,24 @@ fn resolve_images(
 /// material parses share the underlying pixel buffer via refcount
 /// bumps, keeping memory proportional to the number of *unique*
 /// images, not the number of material-texture-slot references.
-pub fn decode_images_once(images: &[gltf::image::Data]) -> Vec<Option<TextureData>> {
-    images.iter().map(material::image_to_texture).collect()
+///
+/// Consumes `images` by value rather than borrowing — for the
+/// RGBA8 fast path (which is every image that comes out of
+/// `resolve_images` after downsample) this lets
+/// [`material::image_to_texture`] move the pixel `Vec<u8>`
+/// straight into `TextureData::new` without cloning. Cloning
+/// roughly doubled peak wasm memory on the strangler demo: 26
+/// textures × 16 MB each = ~416 MB of transient duplicate
+/// pixels that wasm's ever-growing linear memory then pinned
+/// for the session.
+pub fn decode_images_once(images: Vec<gltf::image::Data>) -> Vec<Option<TextureData>> {
+    images.into_iter().map(material::image_to_texture).collect()
 }
 
 fn from_import(
     doc: &gltf::Document,
     buffers: &[gltf::buffer::Data],
-    images: &[gltf::image::Data],
+    images: Vec<gltf::image::Data>,
 ) -> Result<GltfScene, Error> {
     let decoded_images = decode_images_once(images);
     let meshes = doc
