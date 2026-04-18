@@ -25,12 +25,12 @@ categories = ["rendering::data-formats", "graphics"]
 #     blinc_platform = { path = "crates/blinc_platform" }
 #
 # Bump these revs in lockstep with the Blinc repo's `main`.
-blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117" }
-blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117" }
+blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "bed386ab4ac098bc0a24a85cfa12de09083feb15" }
+blinc_canvas_kit = { git = "https://github.com/project-blinc/Blinc.git", rev = "bed386ab4ac098bc0a24a85cfa12de09083feb15" }
 # Optional cross-platform asset loader integration. Gated behind the
 # `platform-assets` feature so pure-desktop users can keep depending
 # on `std::fs` via `load_path` without pulling in the platform crate.
-blinc_platform = { git = "https://github.com/project-blinc/Blinc.git", rev = "63dbf7735f37a778fe9150426bbe0f1f69da7117", optional = true }
+blinc_platform = { git = "https://github.com/project-blinc/Blinc.git", rev = "bed386ab4ac098bc0a24a85cfa12de09083feb15", optional = true }
 
 # Upstream glTF parser. Covers JSON + .glb, accessor decoding, external
 # buffer loading, image decoding via optional features.
@@ -84,6 +84,15 @@ tracing = "0.1"
 # capability probe decides whether to actually upload the BC
 # payload or fall back to Rgba8.
 tbc = { version = "0.3", optional = true }
+
+# Data parallelism for image decode + downsample. 3D scenes with
+# 20-30 textures bottleneck on sequential PNG/JPEG decode (~100-300 ms
+# per 4K image) and bilinear resize (~50-200 ms). A rayon par_iter
+# cuts the load-time stall roughly linearly with core count on
+# native desktops. wasm32 has no rayon threads, so this dep is
+# gated to native targets only and the wasm path stays sequential.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.10"
 
 [features]
 default = []

@@ -268,46 +268,65 @@ pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfSce
 /// normal / metallic-roughness maps, fast enough for load-time.
 #[cfg(feature = "platform-assets")]
 fn downsample_images(images: &mut [gltf::image::Data], max: u32) {
+    // Per-image resize is embarrassingly parallel (each output
+    // image depends only on its own input pixels). On native we
+    // farm the loop across rayon's global pool; a 29-texture
+    // strangler rig on an 8-core desktop cuts 2-3 s of bilinear
+    // resize down to ~400-600 ms. wasm32 has no threads so the
+    // sequential fallback stays.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        images.par_iter_mut().for_each(|img| downsample_one(img, max));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for img in images.iter_mut() {
+            downsample_one(img, max);
+        }
+    }
+}
+
+#[cfg(feature = "platform-assets")]
+fn downsample_one(img: &mut gltf::image::Data, max: u32) {
     use image::{ImageBuffer, Rgba};
     let max = max.max(1);
-    for img in images.iter_mut() {
-        let longer = img.width.max(img.height);
-        if longer <= max {
-            continue;
-        }
-
-        // Promote to RGBA8 inline so `ImageBuffer::from_raw` succeeds
-        // on the subsequent construction. Only R8G8B8 and R8G8B8A8
-        // are handled here; uncommon formats get skipped and pay the
-        // full-res expand later in `material::image_to_texture`.
-        let rgba_pixels: Vec<u8> = match img.format {
-            gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
-            gltf::image::Format::R8G8B8 => {
-                let mut out = Vec::with_capacity(img.pixels.len() / 3 * 4);
-                for chunk in img.pixels.chunks_exact(3) {
-                    out.extend_from_slice(chunk);
-                    out.push(255);
-                }
-                out
-            }
-            _ => continue,
-        };
-
-        let Some(buf): Option<ImageBuffer<Rgba<u8>, Vec<u8>>> =
-            ImageBuffer::from_raw(img.width, img.height, rgba_pixels)
-        else {
-            continue;
-        };
-        let dynimg = image::DynamicImage::ImageRgba8(buf);
-        let scale = max as f32 / longer as f32;
-        let new_w = ((img.width as f32 * scale).round() as u32).max(1);
-        let new_h = ((img.height as f32 * scale).round() as u32).max(1);
-        let resized = dynimg.resize(new_w, new_h, image::imageops::FilterType::Triangle);
-        img.pixels = resized.to_rgba8().into_raw();
-        img.width = new_w;
-        img.height = new_h;
-        img.format = gltf::image::Format::R8G8B8A8;
+    let longer = img.width.max(img.height);
+    if longer <= max {
+        return;
     }
+
+    // Promote to RGBA8 inline so `ImageBuffer::from_raw` succeeds
+    // on the subsequent construction. Only R8G8B8 and R8G8B8A8
+    // are handled here; uncommon formats get skipped and pay the
+    // full-res expand later in `material::image_to_texture`.
+    let rgba_pixels: Vec<u8> = match img.format {
+        gltf::image::Format::R8G8B8A8 => std::mem::take(&mut img.pixels),
+        gltf::image::Format::R8G8B8 => {
+            let mut out = Vec::with_capacity(img.pixels.len() / 3 * 4);
+            for chunk in img.pixels.chunks_exact(3) {
+                out.extend_from_slice(chunk);
+                out.push(255);
+            }
+            out
+        }
+        _ => return,
+    };
+
+    let Some(buf): Option<ImageBuffer<Rgba<u8>, Vec<u8>>> =
+        ImageBuffer::from_raw(img.width, img.height, rgba_pixels)
+    else {
+        return;
+    };
+    let dynimg = image::DynamicImage::ImageRgba8(buf);
+    let scale = max as f32 / longer as f32;
+    let new_w = ((img.width as f32 * scale).round() as u32).max(1);
+    let new_h = ((img.height as f32 * scale).round() as u32).max(1);
+    let resized = dynimg.resize(new_w, new_h, image::imageops::FilterType::Triangle);
+    img.pixels = resized.to_rgba8().into_raw();
+    img.width = new_w;
+    img.height = new_h;
+    img.format = gltf::image::Format::R8G8B8A8;
 }
 
 /// Resolve a relative/data URI to raw bytes via `blinc_platform::assets`.
@@ -384,8 +403,64 @@ fn resolve_images(
     base_dir: &str,
     buffers: &[gltf::buffer::Data],
 ) -> Result<Vec<gltf::image::Data>, Error> {
-    use gltf::image::Format;
-    use image::GenericImageView;
+    // Only swap in the placeholder once the host loader says no more
+    // bytes are coming. Otherwise a retry-loop caller (e.g. the 3D
+    // demos' `try_load` polling on 100 ms while preload is in flight)
+    // would "succeed" on the first tick with a placeholder baked in,
+    // freeze the scene with an untextured model, and the real
+    // textures would never land because the scene is already built.
+    // Desktop / filesystem loaders report `true` unconditionally, so
+    // this extra check is a no-op there — it's purely for async
+    // preload hosts (web).
+    let preload_settled = blinc_platform::assets::preload_settled();
+
+    // Phase 1 (sequential): resolve every image source to a byte
+    // buffer (or a placeholder marker). Cheap — the asset loader is
+    // either an in-memory cache lookup (web) or an `fs::read` (native).
+    // Ordering matters: the decoded `Vec<gltf::image::Data>` indexes
+    // into glTF accessor references, so we collect here before any
+    // parallel fan-out.
+    enum Encoded<'a> {
+        Bytes(Vec<u8>, Option<&'a str>),
+        Placeholder,
+    }
+    let mut encoded: Vec<Encoded<'_>> = Vec::new();
+    for image in gltf_obj.document.images() {
+        match image.source() {
+            gltf::image::Source::Uri { uri, mime_type } => match resolve_uri_bytes(uri, base_dir) {
+                Ok(bytes) => encoded.push(Encoded::Bytes(bytes, mime_type)),
+                Err(e) if preload_settled => {
+                    tracing::warn!(
+                        "gltf image '{uri}' skipped ({e:?}) — substituting 1×1 placeholder"
+                    );
+                    encoded.push(Encoded::Placeholder);
+                }
+                Err(e) => return Err(e),
+            },
+            gltf::image::Source::View { view, mime_type } => {
+                let buf = &buffers[view.buffer().index()].0;
+                let begin = view.offset();
+                let end = begin + view.length();
+                encoded.push(Encoded::Bytes(buf[begin..end].to_vec(), Some(mime_type)));
+            }
+        }
+    }
+
+    // Phase 2 (parallel on native, sequential on wasm): PNG/JPEG
+    // decode. Each image is ~100-300 ms for a 4K texture; 20-30
+    // textures sequentially turns into multi-second stalls at load.
+    // Rayon's work-stealing farms the decode across cores without
+    // ordering impact — each output slot is written independently.
+    #[cfg(not(target_arch = "wasm32"))]
+    let decoded_vec: Vec<gltf::image::Data> = {
+        use rayon::prelude::*;
+        encoded.into_par_iter().map(decode_image).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let decoded_vec: Vec<gltf::image::Data> =
+        encoded.into_iter().map(decode_image).collect();
+
+    return Ok(decoded_vec);
 
     // A 1×1 opaque-white RGBA8 image. Used when a texture URI fails
     // to resolve or decode so the scene as a whole still loads — a
@@ -398,64 +473,44 @@ fn resolve_images(
     fn placeholder() -> gltf::image::Data {
         gltf::image::Data {
             pixels: vec![255, 255, 255, 255],
-            format: Format::R8G8B8A8,
+            format: gltf::image::Format::R8G8B8A8,
             width: 1,
             height: 1,
         }
     }
 
-    let mut out = Vec::new();
-    for image in gltf_obj.document.images() {
-        let (encoded, mime): (Vec<u8>, Option<&str>) = match image.source() {
-            gltf::image::Source::Uri { uri, mime_type } => match resolve_uri_bytes(uri, base_dir) {
-                Ok(bytes) => (bytes, mime_type),
-                Err(e) => {
-                    tracing::warn!(
-                        "gltf image '{uri}' skipped ({e:?}) — substituting 1×1 placeholder"
-                    );
-                    out.push(placeholder());
-                    continue;
-                }
-            },
-            gltf::image::Source::View { view, mime_type } => {
-                let buf = &buffers[view.buffer().index()].0;
-                let begin = view.offset();
-                let end = begin + view.length();
-                (buf[begin..end].to_vec(), Some(mime_type))
-            }
+    fn decode_image(enc: Encoded<'_>) -> gltf::image::Data {
+        use image::GenericImageView;
+        let (bytes, mime) = match enc {
+            Encoded::Bytes(b, m) => (b, m),
+            Encoded::Placeholder => return placeholder(),
         };
-
-        // Pick a decoder. Fall back to content-sniffing when the
-        // mime type is missing — glTF allows either, and the image
-        // crate's own `guess_format` handles png/jpg cleanly.
         let decoded = match mime {
             Some("image/png") => {
-                image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)
+                image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             }
             Some("image/jpeg") => {
-                image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
+                image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
             }
-            _ => image::load_from_memory(&encoded),
+            _ => image::load_from_memory(&bytes),
         };
-        let decoded = match decoded {
-            Ok(img) => img,
+        match decoded {
+            Ok(img) => {
+                let (w, h) = img.dimensions();
+                let pixels = img.to_rgba8().into_raw();
+                gltf::image::Data {
+                    pixels,
+                    format: gltf::image::Format::R8G8B8A8,
+                    width: w,
+                    height: h,
+                }
+            }
             Err(e) => {
                 tracing::warn!("gltf image decode failed ({e}) — substituting 1×1 placeholder");
-                out.push(placeholder());
-                continue;
+                placeholder()
             }
-        };
-
-        let (w, h) = decoded.dimensions();
-        let pixels = decoded.to_rgba8().into_raw();
-        out.push(gltf::image::Data {
-            pixels,
-            format: Format::R8G8B8A8,
-            width: w,
-            height: h,
-        });
+        }
     }
-    Ok(out)
 }
 
 /// Decode every image in the glTF asset exactly once into an
