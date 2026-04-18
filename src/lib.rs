@@ -389,7 +389,10 @@ where
 
     progress(LoadProgress::stage(LoadStage::Images));
     yield_now().await;
-    let images = resolve_images(&gltf_obj, base_dir, &buffers, opts.max_texture_size)?;
+    // Yielding variant so wasm's single-threaded executor doesn't
+    // freeze the browser tab for seconds while decoding every
+    // texture back-to-back.
+    let images = resolve_images_async(&gltf_obj, base_dir, &buffers, opts.max_texture_size).await?;
 
     progress(LoadProgress::stage(LoadStage::Building));
     yield_now().await;
@@ -573,35 +576,101 @@ fn resolve_buffers(
     Ok(out)
 }
 
+/// Resolved image source — either encoded bytes + optional mime
+/// hint, or a `Placeholder` marker for bindings whose URI couldn't
+/// be fetched. Built by [`resolve_image_sources`] and consumed by
+/// [`decode_image`] / [`decode_image_placeholder`].
+///
+/// Module-level (rather than nested in a function) so
+/// [`resolve_images_async`] can hand-roll a yielding decode loop
+/// without duplicating the fetch phase or the decode body.
 #[cfg(feature = "platform-assets")]
-fn resolve_images(
-    gltf_obj: &gltf::Gltf,
+pub(crate) enum Encoded<'a> {
+    Bytes(Vec<u8>, Option<&'a str>),
+    Placeholder,
+}
+
+/// 1×1 opaque-white RGBA8 substitute used when a texture URI
+/// couldn't be fetched or decoded. Callers fold this in so a
+/// single missing texture doesn't block the whole scene.
+#[cfg(feature = "platform-assets")]
+fn decode_image_placeholder() -> gltf::image::Data {
+    gltf::image::Data {
+        pixels: vec![255, 255, 255, 255],
+        format: gltf::image::Format::R8G8B8A8,
+        width: 1,
+        height: 1,
+    }
+}
+
+/// PNG/JPEG decode + inline downsample. Runs on one image at a
+/// time so callers can choose how to parallelize or yield:
+/// [`resolve_images`] rayon-fans out on native / decodes
+/// sequentially on wasm; [`resolve_images_async`] wraps this in a
+/// per-image yield on wasm so the browser's event loop can tick
+/// between decodes.
+#[cfg(feature = "platform-assets")]
+pub(crate) fn decode_image(enc: Encoded<'_>, max: Option<u32>) -> gltf::image::Data {
+    use image::GenericImageView;
+    let (bytes, mime) = match enc {
+        Encoded::Bytes(b, m) => (b, m),
+        Encoded::Placeholder => return decode_image_placeholder(),
+    };
+    let decoded = match mime {
+        Some("image/png") => image::load_from_memory_with_format(&bytes, image::ImageFormat::Png),
+        Some("image/jpeg") => image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg),
+        _ => image::load_from_memory(&bytes),
+    };
+    match decoded {
+        Ok(mut img) => {
+            // Resize *before* extracting pixels so the full-res
+            // buffer is dropped inside this closure — critical on
+            // wasm where linear memory never shrinks.
+            if let Some(max) = max {
+                let longer = img.width().max(img.height());
+                if longer > max {
+                    let scale = max as f32 / longer as f32;
+                    let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
+                    let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
+                    img = img.resize(new_w, new_h, image::imageops::FilterType::Triangle);
+                }
+            }
+            let (w, h) = img.dimensions();
+            // `into_rgba8` consumes `img` and moves the pixel
+            // buffer when the image is already RGBA8 (common after
+            // the resize branch above). `to_rgba8` would always
+            // clone.
+            let pixels = img.into_rgba8().into_raw();
+            gltf::image::Data {
+                pixels,
+                format: gltf::image::Format::R8G8B8A8,
+                width: w,
+                height: h,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("gltf image decode failed ({e}) — substituting 1×1 placeholder");
+            decode_image_placeholder()
+        }
+    }
+}
+
+/// Resolve every image in `gltf_obj` to its encoded source bytes
+/// (or a placeholder marker). No decode yet — callers pick their
+/// own decode strategy. Fast path: cache lookup on web, `fs::read`
+/// on native.
+#[cfg(feature = "platform-assets")]
+pub(crate) fn resolve_image_sources<'a>(
+    gltf_obj: &'a gltf::Gltf,
     base_dir: &str,
     buffers: &[gltf::buffer::Data],
-    max_texture_size: Option<u32>,
-) -> Result<Vec<gltf::image::Data>, Error> {
-    // Only swap in the placeholder once the host loader says no more
-    // bytes are coming. Otherwise a retry-loop caller (e.g. the 3D
-    // demos' `try_load` polling on 100 ms while preload is in flight)
-    // would "succeed" on the first tick with a placeholder baked in,
-    // freeze the scene with an untextured model, and the real
-    // textures would never land because the scene is already built.
-    // Desktop / filesystem loaders report `true` unconditionally, so
-    // this extra check is a no-op there — it's purely for async
-    // preload hosts (web).
+) -> Result<Vec<Encoded<'a>>, Error> {
+    // Only swap in the placeholder once the host loader says no
+    // more bytes are coming; see [`resolve_images`] for the full
+    // rationale.
     let preload_settled = blinc_platform::assets::preload_settled();
 
-    // Phase 1 (sequential): resolve every image source to a byte
-    // buffer (or a placeholder marker). Cheap — the asset loader is
-    // either an in-memory cache lookup (web) or an `fs::read` (native).
-    // Ordering matters: the decoded `Vec<gltf::image::Data>` indexes
-    // into glTF accessor references, so we collect here before any
-    // parallel fan-out.
-    enum Encoded<'a> {
-        Bytes(Vec<u8>, Option<&'a str>),
-        Placeholder,
-    }
-    let mut encoded: Vec<Encoded<'_>> = Vec::new();
+    let mut encoded: Vec<Encoded<'a>> = Vec::new();
     for image in gltf_obj.document.images() {
         match image.source() {
             gltf::image::Source::Uri { uri, mime_type } => match resolve_uri_bytes(uri, base_dir) {
@@ -622,22 +691,24 @@ fn resolve_images(
             }
         }
     }
+    Ok(encoded)
+}
+
+#[cfg(feature = "platform-assets")]
+fn resolve_images(
+    gltf_obj: &gltf::Gltf,
+    base_dir: &str,
+    buffers: &[gltf::buffer::Data],
+    max_texture_size: Option<u32>,
+) -> Result<Vec<gltf::image::Data>, Error> {
+    let encoded = resolve_image_sources(gltf_obj, base_dir, buffers)?;
 
     // Phase 2 (parallel on native, sequential on wasm): PNG/JPEG
-    // decode + inline downsample. Each image is ~100-300 ms for a
-    // 4K texture; 20-30 textures sequentially turns into multi-
-    // second stalls at load. Rayon's work-stealing farms the decode
-    // across cores without ordering impact — each output slot is
-    // written independently.
-    //
-    // Downsampling folded into the same closure: a 4K RGBA8 buffer
-    // is 64 MB, and on wasm the linear memory only grows (never
-    // shrinks), so keeping a decoded full-res image alive past its
-    // thread's turn pins that 64 MB forever. By resizing before
-    // extracting pixels we drop the source buffer inside the
-    // closure — each thread's peak is ~80 MB (full-res + resize
-    // dest) rather than unbounded, and cuts a strangler-scale wasm
-    // peak of ~1.4 GB down to a few hundred MB.
+    // decode + inline downsample. See [`decode_image`] for the
+    // per-image cost breakdown; the wasm sequential path blocks
+    // the main thread for ~1-3 s on a 20-texture scene — callers
+    // that need cooperative yielding should use
+    // [`resolve_images_async`] instead.
     #[cfg(not(target_arch = "wasm32"))]
     let decoded_vec: Vec<gltf::image::Data> = {
         use rayon::prelude::*;
@@ -652,78 +723,47 @@ fn resolve_images(
         .map(|e| decode_image(e, max_texture_size))
         .collect();
 
-    return Ok(decoded_vec);
+    Ok(decoded_vec)
+}
 
-    // A 1×1 opaque-white RGBA8 image. Used when a texture URI fails
-    // to resolve or decode so the scene as a whole still loads — a
-    // missing diffuse map falls through to `material::parse_material`
-    // and becomes an un-textured (white-tinted) primitive rather than
-    // blocking every other mesh from rendering. Mirrors the web
-    // preloader's partial-failure tolerance: one bad texture
-    // shouldn't leave the loading signal stuck forever while the
-    // rest of the scene sits ready.
-    fn placeholder() -> gltf::image::Data {
-        gltf::image::Data {
-            pixels: vec![255, 255, 255, 255],
-            format: gltf::image::Format::R8G8B8A8,
-            width: 1,
-            height: 1,
-        }
+/// Async variant of [`resolve_images`] that yields to the runtime
+/// between each image decode on wasm. Native delegates to the
+/// rayon-parallel sync version in one shot.
+///
+/// On wasm's single-threaded executor, `resolve_images`' sequential
+/// decode loop blocks the main thread for seconds on scenes with
+/// 20+ textures (each 2K PNG/JPEG decode is ~50-100 ms, each 4K is
+/// ~100-300 ms) — the browser tab visibly freezes. Spreading the
+/// decode across microtasks via `yield_now` between each image
+/// keeps the event loop responsive without extending wall-clock
+/// decode time.
+#[cfg(feature = "platform-assets")]
+async fn resolve_images_async(
+    gltf_obj: &gltf::Gltf,
+    base_dir: &str,
+    buffers: &[gltf::buffer::Data],
+    max_texture_size: Option<u32>,
+) -> Result<Vec<gltf::image::Data>, Error> {
+    // On native, the sync rayon path is strictly faster — it
+    // already uses the full thread pool and adding yields would
+    // just trade that for synchronous scheduling overhead.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        return resolve_images(gltf_obj, base_dir, buffers, max_texture_size);
     }
 
-    fn decode_image(enc: Encoded<'_>, max: Option<u32>) -> gltf::image::Data {
-        use image::GenericImageView;
-        let (bytes, mime) = match enc {
-            Encoded::Bytes(b, m) => (b, m),
-            Encoded::Placeholder => return placeholder(),
-        };
-        let decoded = match mime {
-            Some("image/png") => {
-                image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            }
-            Some("image/jpeg") => {
-                image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
-            }
-            _ => image::load_from_memory(&bytes),
-        };
-        match decoded {
-            Ok(mut img) => {
-                // Resize *before* extracting pixels so the full-res
-                // buffer is dropped inside this closure — critical
-                // on wasm where linear memory never shrinks. The
-                // separate `downsample_images` pass used to see every
-                // full-res image at once; now each thread sees at
-                // most one.
-                if let Some(max) = max {
-                    let longer = img.width().max(img.height());
-                    if longer > max {
-                        let scale = max as f32 / longer as f32;
-                        let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
-                        let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
-                        img = img.resize(new_w, new_h, image::imageops::FilterType::Triangle);
-                    }
-                }
-                let (w, h) = img.dimensions();
-                // `into_rgba8` consumes `img` and moves the pixel
-                // buffer when the image is already RGBA8 (the
-                // common path after the resize branch above).
-                // `to_rgba8` would always clone — same 16 MB per
-                // 2K texture doubled transiently that moving the
-                // `gltf::image::Data` into `image_to_texture`
-                // already eliminated downstream.
-                let pixels = img.into_rgba8().into_raw();
-                gltf::image::Data {
-                    pixels,
-                    format: gltf::image::Format::R8G8B8A8,
-                    width: w,
-                    height: h,
-                }
-            }
-            Err(e) => {
-                tracing::warn!("gltf image decode failed ({e}) — substituting 1×1 placeholder");
-                placeholder()
-            }
+    // On wasm, hand-rolled decode loop with a yield between each
+    // image. Event loop gets a tick between every ~50-300 ms of
+    // synchronous decode work.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let encoded = resolve_image_sources(gltf_obj, base_dir, buffers)?;
+        let mut out = Vec::with_capacity(encoded.len());
+        for enc in encoded {
+            out.push(decode_image(enc, max_texture_size));
+            yield_now().await;
         }
+        Ok(out)
     }
 }
 
