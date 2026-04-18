@@ -251,10 +251,7 @@ pub fn load_asset_with_options(path: &str, opts: &LoadOptions) -> Result<GltfSce
     let base_dir: &str = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
     let gltf_obj = gltf::Gltf::from_slice(&bytes)?;
     let buffers = resolve_buffers(&gltf_obj, base_dir)?;
-    let mut images = resolve_images(&gltf_obj, base_dir, &buffers)?;
-    if let Some(max) = opts.max_texture_size {
-        downsample_images(&mut images, max);
-    }
+    let images = resolve_images(&gltf_obj, base_dir, &buffers, opts.max_texture_size)?;
     from_import(&gltf_obj.document, &buffers, &images)
 }
 
@@ -402,6 +399,7 @@ fn resolve_images(
     gltf_obj: &gltf::Gltf,
     base_dir: &str,
     buffers: &[gltf::buffer::Data],
+    max_texture_size: Option<u32>,
 ) -> Result<Vec<gltf::image::Data>, Error> {
     // Only swap in the placeholder once the host loader says no more
     // bytes are coming. Otherwise a retry-loop caller (e.g. the 3D
@@ -447,18 +445,33 @@ fn resolve_images(
     }
 
     // Phase 2 (parallel on native, sequential on wasm): PNG/JPEG
-    // decode. Each image is ~100-300 ms for a 4K texture; 20-30
-    // textures sequentially turns into multi-second stalls at load.
-    // Rayon's work-stealing farms the decode across cores without
-    // ordering impact — each output slot is written independently.
+    // decode + inline downsample. Each image is ~100-300 ms for a
+    // 4K texture; 20-30 textures sequentially turns into multi-
+    // second stalls at load. Rayon's work-stealing farms the decode
+    // across cores without ordering impact — each output slot is
+    // written independently.
+    //
+    // Downsampling folded into the same closure: a 4K RGBA8 buffer
+    // is 64 MB, and on wasm the linear memory only grows (never
+    // shrinks), so keeping a decoded full-res image alive past its
+    // thread's turn pins that 64 MB forever. By resizing before
+    // extracting pixels we drop the source buffer inside the
+    // closure — each thread's peak is ~80 MB (full-res + resize
+    // dest) rather than unbounded, and cuts a strangler-scale wasm
+    // peak of ~1.4 GB down to a few hundred MB.
     #[cfg(not(target_arch = "wasm32"))]
     let decoded_vec: Vec<gltf::image::Data> = {
         use rayon::prelude::*;
-        encoded.into_par_iter().map(decode_image).collect()
+        encoded
+            .into_par_iter()
+            .map(|e| decode_image(e, max_texture_size))
+            .collect()
     };
     #[cfg(target_arch = "wasm32")]
-    let decoded_vec: Vec<gltf::image::Data> =
-        encoded.into_iter().map(decode_image).collect();
+    let decoded_vec: Vec<gltf::image::Data> = encoded
+        .into_iter()
+        .map(|e| decode_image(e, max_texture_size))
+        .collect();
 
     return Ok(decoded_vec);
 
@@ -479,7 +492,7 @@ fn resolve_images(
         }
     }
 
-    fn decode_image(enc: Encoded<'_>) -> gltf::image::Data {
+    fn decode_image(enc: Encoded<'_>, max: Option<u32>) -> gltf::image::Data {
         use image::GenericImageView;
         let (bytes, mime) = match enc {
             Encoded::Bytes(b, m) => (b, m),
@@ -495,7 +508,22 @@ fn resolve_images(
             _ => image::load_from_memory(&bytes),
         };
         match decoded {
-            Ok(img) => {
+            Ok(mut img) => {
+                // Resize *before* extracting pixels so the full-res
+                // buffer is dropped inside this closure — critical
+                // on wasm where linear memory never shrinks. The
+                // separate `downsample_images` pass used to see every
+                // full-res image at once; now each thread sees at
+                // most one.
+                if let Some(max) = max {
+                    let longer = img.width().max(img.height());
+                    if longer > max {
+                        let scale = max as f32 / longer as f32;
+                        let new_w = ((img.width() as f32 * scale).round() as u32).max(1);
+                        let new_h = ((img.height() as f32 * scale).round() as u32).max(1);
+                        img = img.resize(new_w, new_h, image::imageops::FilterType::Triangle);
+                    }
+                }
                 let (w, h) = img.dimensions();
                 let pixels = img.to_rgba8().into_raw();
                 gltf::image::Data {
