@@ -8,6 +8,12 @@ Blinc's native interchange types (`MeshData`, `Vertex`, `Material`,
 `Skeleton`, `Bone`) plus a thin scene graph ready for
 `blinc_canvas_kit::SceneKit3D`.
 
+
+
+https://github.com/user-attachments/assets/e1c4179c-40b4-42e6-a8d2-4aa0d5c57a43
+
+
+
 ```rust
 use blinc_gltf::load_glb;
 use blinc_canvas_kit::SceneKit3D;
